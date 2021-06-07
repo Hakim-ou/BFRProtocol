@@ -67,16 +67,18 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             # extract the key
             query_components = parse_qs(urlparse(self.path).query)
-            key = query_components['key']
+            key = str(query_components['key'][0]) # query_components['key'] returns a list of arguments
             value = redis_client.get(key)
             if value is None:
                 # content is not in cache, so we will check if it is in
                 # one of the neighbors (all the other caches are our
                 # neighbors for the moment). 
                 print("Content not in cache. Checking neighboors...")
-                timestamps = redis_client.mget((f"ts:{ip[0]}:{ip[1]}" for ip in ips))
+                # TODO lookup timestamps with mget (one network call to redis)
                 found = False
-                for ip, timestamp in zip(ips, timestamps):
+                for ip in ips:
+                    timestamp = redis_client.get(f"ts:{ip[0]}:{ip[1]}").decode('utf-8')
+                    print(timestamp)
                     if redis_client.bfExists(f"bf:{ip[0]}:{ip[1]}:{timestamp}", key):
                         found = True
                         print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
