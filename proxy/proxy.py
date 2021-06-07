@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+from gevent import monkey
+monkey.patch_all()
+
 from http.server import BaseHTTPRequestHandler, HTTPServer 
 from urllib.parse import urlparse, parse_qs
 from redisbloom.client import Client
@@ -7,15 +12,23 @@ import calendar;
 import threading
 import grequests
 import json
+import sys
+import base64
+
+# Local address
+LOCAL_IP = sys.argv[1]
+LOCAL_PORT = int(sys.argv[2])
 
 # RedisBloom Client
-redis_client = Client()
+redis_client = Client(host=LOCAL_IP, port=LOCAL_PORT)
 
 # load neighbors ip addresses.
-ips = set()
+ips = list()
 with open("ips.txt", "r") as f:
     for line in f:
-        ips.add(line.strip())
+        adr = line.strip()
+        ip, port, db = adr.split(":")
+        ips.append([ip, int(port), int(db)])
 
 # redis standard port
 STANDARD_PORT = 6379
@@ -50,27 +63,34 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         """
         do_GET will deal with client Interests
         """
+        print("Get request recieved...")
         try:
             # extract the key
             query_components = parse_qs(urlparse(self.path).query)
             key = query_components['key']
             value = redis_client.get(key)
             if value is None:
-                # content not in cache, so we will check if it is in
+                # content is not in cache, so we will check if it is in
                 # one of the neighbors (all the other caches are our
                 # neighbors for the moment). 
-                timestamps = redis_client.mget((f"ts:{ip}" for ip in ips))
+                print("Content not in cache. Checking neighboors...")
+                timestamps = redis_client.mget((f"ts:{ip[0]}:{ip[1]}" for ip in ips))
+                found = False
                 for ip, timestamp in zip(ips, timestamps):
-                    if redis_client.bfExists(f"bf:{ip}:{timestamp}", key):
+                    if redis_client.bfExists(f"bf:{ip[0]}:{ip[1]}:{timestamp}", key):
+                        found = True
+                        print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
                         # send request to redis ip (standard port 6379)
-                        distant_client = redis.Redis(ip, STANDARD_PORT)
+                        distant_client = redis.Redis(ip[0], ip[1])
                         value = distant_client.get(key) # we suppose that the returned value 
                                                         # is of string type.
                         self.send_response(200)
                         self.wfile.write(value)
-                        return
-                self.send_response(404)
+                if not found:
+                    print("Content not found...404")
+                    self.send_response(404)
             else:
+                print("Content found in cache...200 OK")
                 # content is in cache, return it directly
                 self.send_response(200)
                 self.wfile.write(value)
@@ -81,15 +101,18 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
         """
         do_POST will deal with Content Advertisments
         """
+        print("Post request recieved...")
         try:
             content_len = int(self.headers.get('Content-Length'))
             post_body = self.rfile.read(content_len)
-            bloom_chunks = json.load(post_body)
-            ip = self.client_address[0]
-            assert(ip in ips, "Got POST request from unknown source") # make sure this post is from a known neighboor
+            bloom_chunks = json.loads(post_body.decode('utf-8'))
+            ip, port = str(bloom_chunks["address"]).split(":")
+            print(f"From: {ip}:{port}")
+            bloom_chunks = bloom_chunks['bf']
+            #assert(ip in ips, "Got POST request from unknown source") # make sure this post is from a known neighboor
             timestamp = calendar.timegm(time.gmtime())
-            redis_client.set(f"ts:{ip}", timestamp)
-            restoreBF(bloom_chunks, f"bf:{ip}:{timestamp}")
+            redis_client.set(f"ts:{ip}:{port}", timestamp)
+            restoreBF(bloom_chunks, f"bf:{ip}:{port}:{timestamp}")
         finally:
             self.finish()
 
@@ -105,9 +128,9 @@ def saveBF():
         if iter == 0:
             return chunks
         else:
-            chunks.append([iter, data])
+            chunks.append([iter, base64.b64encode(data).decode('ascii')])
 
-def chekckForNews():
+def checkForNews():
     """
     checks if there is any new keys in redis. In this case,
     global variables BLOOM_UP_TO_DATE and BLOOM_DUMP are updated
@@ -116,8 +139,8 @@ def chekckForNews():
     # iterate over keys and BF.ADD them to local BF
     # NB: This step wont be necessary when we'll have
     #     control over writes (BF.ADD after evry write)
-    for key in redis_client.keys:
-        if not key.startswith("bf:"):
+    for key in redis_client.keys():
+        if not (str(key).startswith("b'bf:") or str(key).startswith("b'ts:")):
             redis_client.bfAdd(LOCAL_BLOOM, key)
     new_dump = saveBF()
 
@@ -125,8 +148,7 @@ def chekckForNews():
             BLOOM_UP_TO_DATE = False
             BLOOM_DUMP = new_dump
     else:
-        BLOOM_UP_TO_DATE = False
-        BLOOM_DUMP = new_dump
+        BLOOM_UP_TO_DATE = True
 
 def restoreBF(chunks, key):
     """
@@ -137,7 +159,7 @@ def restoreBF(chunks, key):
     """
     for chunk in chunks:
         iter, data = chunk
-        redis_client.bfLoadChunk(key, iter, data)
+        redis_client.bfLoadChunk(key, iter, base64.b64decode(data))
 
 def CAIsProducer():
     """
@@ -145,25 +167,28 @@ def CAIsProducer():
     and sends update to neighbors if we found any
     """
     while True:
-        chekckForNews()
+        print("Cheking for new content")
+        checkForNews()
         if not BLOOM_UP_TO_DATE:
             # send update to neighbors. We used grequests for multithreading
-            json_bloom = json.dump(BLOOM_DUMP)
-            urls = [f"http://{ip}:{STANDARD_PORT}" for ip in ips]
-            rs = (grequests.post(u, json_bloom) for u in urls)
+            print("Sending CAI to neighbors...")
+            json_bloom = {"address":f"{LOCAL_IP}:{LOCAL_PORT}", "bf":BLOOM_DUMP}
+            json_bloom = json.dumps(json_bloom)
+            urls = [f"http://{ip[0]}:{ip[1]+1}" for ip in ips if ip[1] != LOCAL_PORT]
+            rs = (grequests.post(u, data=json_bloom) for u in urls)
             grequests.map(rs)
         time.sleep(1)
 
 if __name__ == '__main__':
-    # lunch Interests and CAIs handlers
-    server_address = ('127.0.0.1', 6380)
-    httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
-    print('http server is running')
-    httpd.serve_forever()
-
     # lunch CA producer
     CAIsProducerThread = threading.Thread(target=CAIsProducer)
     CAIsProducerThread.start()
+
+    # lunch Interests and CAIs handlers
+    server_address = (LOCAL_IP, LOCAL_PORT+1) # if port for redis is 6379, the port for the proxy is 6380
+    httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
+    print('http server is running')
+    httpd.serve_forever()
 
 
 
