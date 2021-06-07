@@ -76,9 +76,12 @@ class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
                 print("Content not in cache. Checking neighboors...")
                 # TODO lookup timestamps with mget (one network call to redis)
                 found = False
-                for ip in ips:
-                    timestamp = redis_client.get(f"ts:{ip[0]}:{ip[1]}").decode('utf-8')
-                    print(timestamp)
+                timestamps = redis_client.mget((f"ts:{ip[0]}:{ip[1]}" for ip in ips))
+                for ip, timestamp in zip(ips, timestamps):
+                    #timestamp = redis_client.get(f"ts:{ip[0]}:{ip[1]}").decode('utf-8')
+                    if timestamp is None:
+                        continue
+                    timestamp = timestamp.decode('utf-8')
                     if redis_client.bfExists(f"bf:{ip[0]}:{ip[1]}:{timestamp}", key):
                         found = True
                         print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
