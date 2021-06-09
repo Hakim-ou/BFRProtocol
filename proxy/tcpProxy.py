@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import async_timeout
 import sys
 import base64
 import json
@@ -52,6 +53,7 @@ class PushBasedProxy:
         Connect to a host
         """
         print(f"Connecting to {host}:{port} ...")
+        await self.disconnect()
         self.r, self.w = await asyncio.open_connection(host=host, port=port)
         self.connected = True
 
@@ -70,18 +72,17 @@ class PushBasedProxy:
     async def connectTO(self, host=LOCAL_HOST, port=LOCAL_PORT, timeout=1):
         """
         Connect to a host and if the connection takes longer then timeout
-        raise Exception
+        skip connection
         """
         print(f"Connecting to {host}:{port} with timeout {timeout} ...")
-        fut = asyncio.open_connection(host=host, port=port)
-        try:
-            # Wait for 3 seconds, then raise TimeoutError
-            self.r, self.w = await asyncio.wait_for(fut, timeout=timeout)
+        await self.disconnect()
+        async with async_timeout.timeout(timeout):
+            self.r, self.w = await asyncio.open_connection(host=host, port=port)
             self.connected = True
-            return True
-        except asyncio.TimeoutError:
-            print(f"Timeout, skipping {host}:{port}")
-            return False
+        #try:
+        #    await asyncio.wait_for(self.connect(host, port), timeout=timeout)
+        #except asyncio.TimeoutError:
+        #    print(f"Timeout, skipping {host}:{port}")
 
     """""""""""""""""""""""""""""""""""""""""""""
                 read operations
@@ -388,10 +389,15 @@ async def CAIsProducer():
             for ip in ips:
                 if ip[1] == LOCAL_PORT: # TODO add local_host also
                     continue
-                succeeded = await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
-                if not succeeded:
+                #asyncio.run(proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout))
+                #async with async_timeout.timeout(timeout):
+                #    await proxy.connect(host=ip[0], port=ip[1]+1)
+                await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
+                if not proxy.connected:
+                    print("not connected")
                     sleep_time -= timeout
                     continue
+                print("connected")
                 json_bloom = b'J' + json_bloom.encode() + b'\r\n'
                 print(f"writing '{json_bloom}' to proxy {ip[0]}:{ip[1]+1}...")
                 await write(proxy.w, json_bloom, True)
