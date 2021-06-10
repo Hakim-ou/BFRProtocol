@@ -77,10 +77,12 @@ class PushBasedProxy:
         """
         print(f"Connecting to {host}:{port} ...")
         await self.disconnect()
-        self.r, self.w = await asyncio.open_connection(host=host, port=port, loop=asyncio.get_running_loop())
+        self.r, self.w = await asyncio.open_connection(host=host, port=port)
         self.connected = True
         if task is not None:
             task.cancel()
+        else:
+            print(task)
         print(f"Connecting to {host}:{port} ...Done!")
 
     async def disconnect(self):
@@ -108,13 +110,15 @@ class PushBasedProxy:
         #    self.r, self.w = await asyncio.open_connection(host=host, port=port, loop=asyncio.get_running_loop())
         #    print("await responded")
         #    self.connected = True
-        timing = asyncio.sleep(timeout)
+        #timing = asyncio.sleep(timeout)
+        timing = asyncio.create_task(asyncio.sleep(timeout))
         connection = asyncio.create_task(self.connect(host, port, timing))
         try:
             await timing
-            print("Time's up! Canceling connection...")
-            connection.cancel()
-            print("Canceling connection...Done!")
+            if not timing.cancelled():
+                print("Time's up! Canceling connection...")
+                connection.cancel()
+                print("Canceling connection...Done!")
         except asyncio.CancelledError:
             print(f"Connecting to {host}:{port} with timeout {timeout} ...Done!")
         #try:
@@ -544,7 +548,6 @@ def export_loop(coroutine):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     asyncio.run_coroutine_threadsafe(coroutine, asyncio.get_event_loop())
-    print(loop)
     loop.run_forever()
 
 async def server():
