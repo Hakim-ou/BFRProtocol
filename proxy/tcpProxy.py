@@ -7,6 +7,7 @@ import base64
 import json
 import time
 import calendar
+import threading
 from redisbloom.client import Client
 from redis.exceptions import ResponseError
 
@@ -447,7 +448,8 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         #async with async_timeout.timeout(timeout):
         #    await proxy.connect(host=ip[0], port=ip[1]+1)
         print(f"Sending CAI to {ip[0]}:{ip[1]}...")
-        await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
+        #await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
+        await proxy.connect(host=ip[0], port=ip[1]+1)
         if not proxy.connected:
             print("not connected")
             sleep_time -= timeout
@@ -468,11 +470,12 @@ async def CAIsProducer():
     while True:
         checkForNews()
         #if not BLOOM_UP_TO_DATE:
-        if not False:
+        sleep_time = SLEEP_TIME
+        if True:
             # send update to neighbors. We used grequests for multithreading
             sleep_time = await sendCAIs()
             print('sleep time', sleep_time)
-        time.sleep(sleep_time)
+        asyncio.sleep(sleep_time)
 
 
 
@@ -525,19 +528,33 @@ async def write(writer, data, closeAtEnd=False):
         writer.close()
         await writer.wait_closed()
 
+def export_loop(coroutine):
+    """
+    TODO
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    asyncio.run_coroutine_threadsafe(coroutine, asyncio.get_event_loop())
+    loop.run_forever()
 
-async def main():
-    # lunch CA producer
-    print("Lunching CAIs Producer....")
-    future = asyncio.run_coroutine_threadsafe(CAIsProducer(), asyncio.get_event_loop())
-    #future.result()
-    #CAIsProducerThread = threading.Thread(target=CAIsProducer)
-    #CAIsProducerThread.start()
-
-    print("Lunching server....")
+async def server():
+    """
+    TODO
+    """
     server = await asyncio.start_server(client_connected_cb, host=LOCAL_HOST, port=LOCAL_PORT+1)
     async with server:
         await server.serve_forever()
+
+async def main():
+    # lunch server
+    print("Lunching server....")
+    serverThread = threading.Thread(target=export_loop, args=(server(),))
+    serverThread.start()
+
+    # lunch CA producer
+    print("Lunching CAIs Producer....")
+    CAIsProducerThread = threading.Thread(target=export_loop, args=(CAIsProducer(),))
+    CAIsProducerThread.start()
 
 if __name__ == '__main__':
     asyncio.run(main())
