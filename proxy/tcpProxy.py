@@ -71,14 +71,16 @@ class PushBasedProxy:
     def __init__(self):
         self.connected = False
 
-    async def connect(self, host=LOCAL_HOST, port=LOCAL_PORT):
+    async def connect(self, host=LOCAL_HOST, port=LOCAL_PORT, task=None):
         """
         Connect to a host
         """
         print(f"Connecting to {host}:{port} ...")
         await self.disconnect()
-        self.r, self.w = await asyncio.open_connection(host=host, port=port)
+        self.r, self.w = await asyncio.open_connection(host=host, port=port, loop=asyncio.get_running_loop())
         self.connected = True
+        if task is not None:
+            task.cancel()
         print(f"Connecting to {host}:{port} ...Done!")
 
     async def disconnect(self):
@@ -101,12 +103,20 @@ class PushBasedProxy:
         """
         print(f"Connecting to {host}:{port} with timeout {timeout} ...")
         await self.disconnect()
-        async with async_timeout.timeout(timeout) as cm:
-            print("got inside")
-            self.r, self.w = await asyncio.open_connection(host=host, port=port)
-            print("await responded")
-            self.connected = True
-        print(f"Connecting to {host}:{port} with timeout {timeout} ...Done!")
+        #async with async_timeout.timeout(timeout) as cm:
+        #    print("got inside")
+        #    self.r, self.w = await asyncio.open_connection(host=host, port=port, loop=asyncio.get_running_loop())
+        #    print("await responded")
+        #    self.connected = True
+        timing = asyncio.sleep(timeout)
+        connection = asyncio.create_task(self.connect(host, port, timing))
+        try:
+            await timing
+            print("Time's up! Canceling connection...")
+            connection.cancel()
+            print("Canceling connection...Done!")
+        except asyncio.CancelledError:
+            print(f"Connecting to {host}:{port} with timeout {timeout} ...Done!")
         #try:
         #    await asyncio.wait_for(self.connect(host, port), timeout=timeout)
         #except asyncio.TimeoutError:
@@ -428,7 +438,7 @@ def restoreBF(chunks, key):
         redis_client.bfLoadChunk(key, itera, base64.b64decode(data))
 
 # time to sleep between CAIs
-SLEEP_TIME = 1 # 1 second
+SLEEP_TIME = 5 # TODO change to 1 second
 
 async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=[]):
     """
@@ -444,12 +454,12 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     for ip in ips:
         if ip[1] == LOCAL_PORT or ip[1] == nextHope[1]: # TODO add local_host also
             continue
+        print(f"Sending CAI to {ip[0]}:{ip[1]}...")
         #asyncio.run(proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout))
         #async with async_timeout.timeout(timeout):
         #    await proxy.connect(host=ip[0], port=ip[1]+1)
-        print(f"Sending CAI to {ip[0]}:{ip[1]}...")
-        #await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
-        await proxy.connect(host=ip[0], port=ip[1]+1)
+        await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
+        #await proxy.connect(host=ip[0], port=ip[1]+1)
         if not proxy.connected:
             print("not connected")
             sleep_time -= timeout
@@ -469,13 +479,12 @@ async def CAIsProducer():
     """
     while True:
         checkForNews()
-        #if not BLOOM_UP_TO_DATE:
-        sleep_time = SLEEP_TIME
-        if True:
+        if not BLOOM_UP_TO_DATE:
+        #if True:
             # send update to neighbors. We used grequests for multithreading
-            sleep_time = await sendCAIs()
-            print('sleep time', sleep_time)
-        asyncio.sleep(sleep_time)
+            asyncio.create_task(sendCAIs())
+        print('going to sleep')
+        await asyncio.sleep(SLEEP_TIME)
 
 
 
@@ -535,6 +544,7 @@ def export_loop(coroutine):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     asyncio.run_coroutine_threadsafe(coroutine, asyncio.get_event_loop())
+    print(loop)
     loop.run_forever()
 
 async def server():
