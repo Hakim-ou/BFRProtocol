@@ -8,13 +8,31 @@ import json
 import time
 import calendar
 from redisbloom.client import Client
+from redis.exceptions import ResponseError
 
 # Local address
 LOCAL_HOST = sys.argv[1]
 LOCAL_PORT = int(sys.argv[2])
 
+# local bloom standard name
+LOCAL_BLOOM = "bf:localBF"
+
+# local bloom old value
+BLOOM_DUMP = [] # table of chunks
+BLOOM_UP_TO_DATE = True # no new data
+
 # RedisBloom Client, it will be used for results that we do not need to forward
 redis_client = Client(host=LOCAL_HOST, port=LOCAL_PORT)
+try:
+    print("Loading Redis Bloom...")
+    redis_client.execute_command('MODULE LOAD', '/etc/redis/redisbloom.so')
+except ResponseError:
+    print("Redis Bloom is already loaded !")
+try:
+    print("Initializing local BF...")
+    redis_client.execute_command('BF.RESERVE', LOCAL_BLOOM, '0.01', '1000')
+except ResponseError as e:
+    print("Local BF is already initialized!")
 
 # load neighbors ip addresses.
 ips = list()
@@ -23,6 +41,10 @@ with open("ips.txt", "r") as f:
         adr = line.strip()
         ip, port, db = adr.split(":")
         ips.append([ip, int(port), int(db)])
+       
+# FIB
+# forme of entry: 'sourceID': {'currentNounce':nounce, 'nextHope':[ip, port], 'receivedNounces':set()}
+FIB = dict()
 
 
 
@@ -56,6 +78,7 @@ class PushBasedProxy:
         await self.disconnect()
         self.r, self.w = await asyncio.open_connection(host=host, port=port)
         self.connected = True
+        print(f"Connecting to {host}:{port} ...Done!")
 
     async def disconnect(self):
         """
@@ -67,6 +90,7 @@ class PushBasedProxy:
         self.w.close()
         await self.w.wait_closed()
         self.connected = False
+        print("Disconnecting proxy's connections...Done!")
 
 
     async def connectTO(self, host=LOCAL_HOST, port=LOCAL_PORT, timeout=1):
@@ -76,9 +100,12 @@ class PushBasedProxy:
         """
         print(f"Connecting to {host}:{port} with timeout {timeout} ...")
         await self.disconnect()
-        async with async_timeout.timeout(timeout):
+        async with async_timeout.timeout(timeout) as cm:
+            print("got inside")
             self.r, self.w = await asyncio.open_connection(host=host, port=port)
+            print("await responded")
             self.connected = True
+        print(f"Connecting to {host}:{port} with timeout {timeout} ...Done!")
         #try:
         #    await asyncio.wait_for(self.connect(host, port), timeout=timeout)
         #except asyncio.TimeoutError:
@@ -99,32 +126,30 @@ class PushBasedProxy:
             tmp = await self._read_bluk()
             response = tmp[0]
             bruteAnswer += tmp[1]
-            return response, bruteAnswer
         elif ch == b'+':
             tmp = await self._read_simple_string()
             response = tmp[0]
             bruteAnswer += tmp[1]
-            return response, bruteAnswer
         elif ch == b'-':
             tmp = await self._read_simple_string()
             response = tmp[0].split(" ", 1)
             response = {"error":response[0], "msg":response[1] if len(response) > 1 else ""}
             bruteAnswer += tmp[1]
-            return response, bruteAnswer
         elif ch == b':':
             tmp = await self._read_int()
             response = tmp[0]
             bruteAnswer += tmp[1]
-            return response, bruteAnswer
         elif ch == b'*':
             tmp = await self._read_array()
             response = tmp[0]
             bruteAnswer += tmp[1]
-            return response, bruteAnswer
         else:
             print("Reading error...")
             msg = await self.r.read(100)
+            print("Reading error...Done!")
             raise Exception(f"Unknown tag: {ch}, msg: {msg}")
+        print("Reading reply...Done")
+        return response, bruteAnswer
             
     async def _read_int(self):
         print("Reading integer...")
@@ -135,6 +160,7 @@ class PushBasedProxy:
             ch = await self.r.read(1)
             length += ch
             bruteAnswer += ch
+        print("Reading integer...Done!")
         return int(length.decode()[:-1]), bruteAnswer
 
     async def _read_simple_string(self):
@@ -146,6 +172,7 @@ class PushBasedProxy:
             ch = await self.r.read(1)
             response += ch
             bruteAnswer += ch
+        print("Reading simple string...Done!")
         return response.decode()[:-1], bruteAnswer
     
     async def _read_bluk(self):
@@ -155,6 +182,7 @@ class PushBasedProxy:
             return None, bruteAnswer
         response = await self.r.read(length)
         bruteAnswer += response + b'\r\n'
+        print("Reading bulk...Done!")
         return response.decode()[:-1], bruteAnswer
 
     async def _read_array(self):
@@ -169,6 +197,7 @@ class PushBasedProxy:
                 tmp = await self._read_int()
             response.append(tmp[0])
             bruteAnswer += tmp[1]
+        print("Reading array...Done!")
         return response, bruteAnswer
 
 
@@ -188,7 +217,9 @@ class PushBasedProxy:
         print(f"Writing '{query}' to redis...")
         self.w.write(query)
         await self.w.drain()
+        print(f"Writing '{query}' to redis...Done!")
         response = await self._read_answer()
+        print(f"Forwarding query to {host}:{port} ...Done!")
         return response
 
     async def _treate_get_query(self, params, query):
@@ -204,6 +235,7 @@ class PushBasedProxy:
             print("Content not in cache. Checking neighbors...")
             key = params[0]
             value, response = await self._checkFIBForContent(key, query)
+            print("Content not in cache. Checking neighbors...Done!")
         else:
             print("Content found in cache...200 OK")
             # content is in cache, return it directly
@@ -215,6 +247,7 @@ class PushBasedProxy:
         """
         print("Parsing query...")
         query = query[:-2].decode().split()
+        print("Parsing query...Done!")
         return {"command":query[0], "params":query[1:]}
 
     async def treate_query(self, query):
@@ -226,9 +259,11 @@ class PushBasedProxy:
         if command == "GET":
             print("GET command detected. Dealing with it...")
             response = await self._treate_get_query(params, query)
+            print("GET command detected. Dealing with it...Done!")
         else:
             print("No GET command detected. Forwarding...")
             response = (await self._forward_query(query))[1] # brute answer
+            print("No GET command detected. Forwarding...Done!")
         return response
 
     async def treate_JSON(self, query):
@@ -237,9 +272,13 @@ class PushBasedProxy:
         """
         print("Treating JSON query...")
         bloom_chunks = json.loads(query[1:-2].decode()) # query starts with 'J' and ends with '\r\n'
-        source_host, source_port = str(bloom_chunks["address"]).split(":")
+        source_host, source_port = str(bloom_chunks["nextHope"]).split(":")
+        source_port = int(source_port)
+        sourceID = bloom_chunks["sourceID"] 
+        nounce = bloom_chunks["nounce"]
         bloom_chunks = bloom_chunks['bf']
-        self._populateFIB(source_host, source_port, bloom_chunks)
+        await self._populateFIB(sourceID, nounce, source_host, source_port, bloom_chunks)
+        print("Treating JSON query...Done!")
 
     
     """""""""""""""""""""""""""""""""""""""""""""
@@ -252,12 +291,12 @@ class PushBasedProxy:
         will be executed if key is not a string
         """
         if isinstance(key, str):
-            response = self._forward_query(f"GET {key}\r\n".encode(),host,port)
+            response = await self._forward_query(f"GET {key}\r\n".encode(),host,port)
             print(f"GET {key} answered {response.decode()}")
             return response
         else:
             key = " ".join(key)
-            response = self._forward_query(f"MGET {key}\r\n".encode(),host,port)
+            response = await self._forward_query(f"MGET {key}\r\n".encode(),host,port)
             print(f"MGET {key} answered {response.decode()}")
             return response
         
@@ -283,34 +322,48 @@ class PushBasedProxy:
         value. Otherwise, it returns the equevelent of null value,
         namely: (value=-1, response=b'$-1\r\n')
         """
-        # timestamps = self._get_query((f"ts:{ip[0]}:{ip[1]}" for ip in ips))
-        timestamps = redis_client.mget((f"ts:{ip[0]}:{ip[1]}" for ip in ips))
         value, response = -1, b'$-1\r\n'
-        for ip, timestamp in zip(ips, timestamps):
-            #timestamp = redis_client.get(f"ts:{ip[0]}:{ip[1]}").decode('utf-8')
-            if timestamp is None:
-                continue
-            timestamp = timestamp.decode('utf-8')
-            if redis_client.bfExists(f"bf:{ip[0]}:{ip[1]}:{timestamp}", key):
+        for sourceID in FIB.keys():
+            if redis_client.bfExists(f"bf:{sourceID}:{FIB[sourceID]['currentNounce']}", key):
+                ip = FIB[sourceID]['nextHope']
                 print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
-                # send request to redis ip (standard port 6379)
+                # send request to redis ip
                 value, response = await self._forward_query(query, host=ip[0], port=ip[1])
                 if value != -1:
+                    print(f"Content found at {ip[0]}:{ip[1]} !")
                     return value, response
                 else:
                     print(f"Content not found at {ip[0]}:{ip[1]} !")
         print("Content not found...404")
         return value, response
-        #raise ContentNotFound()
 
-    def _populateFIB(self, source_host, source_port, bloom_chunks):
+    async def _populateFIB(self, sourceID, nounce, source_host, source_port, bloom_chunks):
         """
         TODO
         """
+        if sourceID == f"{LOCAL_HOST}:{LOCAL_PORT}":
+            print("Received my own advertisment. Droping it !")
+            return
         print("Populating FIB...")
-        timestamp = calendar.timegm(time.gmtime())
-        redis_client.set(f"ts:{source_host}:{source_port}", timestamp)
-        restoreBF(bloom_chunks, f"bf:{source_host}:{source_port}:{timestamp}")
+        if sourceID not in FIB.keys():
+            FIB[sourceID] = {'currentNounce': nounce, 'nextHope':[source_host, source_port], 'receivedNounces':{nounce}}
+        else:
+            if nounce in FIB[sourceID]['receivedNounces']:
+                print('duplicated nounce', nounce)
+                return
+            else:
+                print('received nounce', nounce)
+                print('old nounces', FIB[sourceID]['receivedNounces'])
+                FIB[sourceID]['currentNounce'] = nounce
+                FIB[sourceID]['receivedNounces'].add(nounce)
+                FIB[sourceID]['nextHope'] = [source_host, source_port]
+        restoreBF(bloom_chunks, f"bf:{sourceID}:{nounce}")
+        print("Populating FIB...Done!")
+        # forward CAI to neighbors, except the neighbor that sent us this CAI
+        print(f"Forwarding FIB to neighboors...")
+        await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bloom_chunks)
+        print(f"Forwarding FIB to neighbors...Done!")
+
 
 
 
@@ -318,39 +371,41 @@ class PushBasedProxy:
                             CAIs and CARs producers
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-# local bloom standard name
-LOCAL_BLOOM = "bf:localBF"
-
-# local bloom old value
-BLOOM_DUMP = [] # table of chunks
-BLOOM_UP_TO_DATE = True # no new data
-
 def saveBF(bloom=LOCAL_BLOOM):
     """
     dumps the local bloom. Multiple chunks are used in case
     the BF is too large to be SAVEd in one chunk
     """
     chunks = []
-    iter = 0
+    itera = 0
     while True:
-        iter, data = redis_client.bfScandump(bloom, iter)
-        if iter == 0:
+        try:
+            itera, data = redis_client.bfScandump(bloom, itera)
+        except ResponseError:
+            print(f"Can not save bf {bloom}. Reserving BF {bloom}...")
+        if itera == 0:
             return chunks
         else:
-            chunks.append([iter, base64.b64encode(data).decode('ascii')])
+            chunks.append([itera, base64.b64encode(data).decode('ascii')])
 
 def checkForNews():
     """
     checks if there is any new keys in redis. In this case,
     global variables BLOOM_UP_TO_DATE and BLOOM_DUMP are updated
     """
+    print("Checking for new content...")
     global BLOOM_DUMP, BLOOM_UP_TO_DATE
     # iterate over keys and BF.ADD them to local BF
     # NB: This step wont be necessary when we'll have
     #     control over writes (BF.ADD after evry write)
     for key in redis_client.keys():
         if not (str(key).startswith("b'bf:") or str(key).startswith("b'ts:")):
-            redis_client.bfAdd(LOCAL_BLOOM, key)
+            try:
+                redis_client.bfAdd(LOCAL_BLOOM, key)
+            except ResponseError:
+                print("BF {} does not exist. Creating it...")
+                redis_client.bfInsert(LOCAL_BLOOM, key, capacity=1000, error=0.01)
+                print("Creating it...Done!")
     new_dump = saveBF()
 
     if (len(new_dump) != len(BLOOM_DUMP)) or any((new_dump[i][1] != BLOOM_DUMP[i][1] for i in range(len(new_dump)))):
@@ -358,6 +413,7 @@ def checkForNews():
             BLOOM_DUMP = new_dump
     else:
         BLOOM_UP_TO_DATE = True
+    print("Checking for new content...Done!")
 
 def restoreBF(chunks, key):
     """
@@ -367,41 +423,55 @@ def restoreBF(chunks, key):
     :param: key the name to give to the BF
     """
     for chunk in chunks:
-        iter, data = chunk
-        redis_client.bfLoadChunk(key, iter, base64.b64decode(data))
+        itera, data = chunk
+        redis_client.bfLoadChunk(key, itera, base64.b64decode(data))
+
+# time to sleep between CAIs
+SLEEP_TIME = 1 # 1 second
+
+async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=[]):
+    """
+    Sends CAIs to neighboors with 'sourceID'=sourceID
+    """
+    print("Sending CAI to neighbors...")
+    sleep_time = SLEEP_TIME
+    bf = bf if len(bf) > 0 else BLOOM_DUMP
+    json_bloom = {"code":"CAI", "sourceID":sourceID, "nounce":calendar.timegm(time.gmtime()), "nextHope":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":bf}
+    json_bloom = json.dumps(json_bloom)
+    proxy = PushBasedProxy()
+    timeout = sleep_time / len(ips) if len(ips) != 0 else sleep_time
+    for ip in ips:
+        if ip[1] == LOCAL_PORT or ip[1] == nextHope[1]: # TODO add local_host also
+            continue
+        #asyncio.run(proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout))
+        #async with async_timeout.timeout(timeout):
+        #    await proxy.connect(host=ip[0], port=ip[1]+1)
+        print(f"Sending CAI to {ip[0]}:{ip[1]}...")
+        await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
+        if not proxy.connected:
+            print("not connected")
+            sleep_time -= timeout
+            continue
+        print("connected")
+        json_bloom = b'J' + json_bloom.encode() + b'\r\n'
+        print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]+1}...")
+        await write(proxy.w, json_bloom, True)
+        print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
+    print("Sending CAI to neighbors...Done !")
+    return sleep_time
 
 async def CAIsProducer():
     """
     Checks every second if there is any new keys in redis,
     and sends update to neighbors if we found any
     """
-    sleep_time = 1 # 1 second
     while True:
-        print("Cheking for new content")
         checkForNews()
-        if not BLOOM_UP_TO_DATE:
+        #if not BLOOM_UP_TO_DATE:
+        if not False:
             # send update to neighbors. We used grequests for multithreading
-            print("Sending CAI to neighbors...")
-            json_bloom = {"code":"CAI", "address":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":BLOOM_DUMP}
-            json_bloom = json.dumps(json_bloom)
-            proxy = PushBasedProxy()
-            timeout = sleep_time / len(ips) if len(ips) != 0 else sleep_time
-            for ip in ips:
-                if ip[1] == LOCAL_PORT: # TODO add local_host also
-                    continue
-                #asyncio.run(proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout))
-                #async with async_timeout.timeout(timeout):
-                #    await proxy.connect(host=ip[0], port=ip[1]+1)
-                await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
-                if not proxy.connected:
-                    print("not connected")
-                    sleep_time -= timeout
-                    continue
-                print("connected")
-                json_bloom = b'J' + json_bloom.encode() + b'\r\n'
-                print(f"writing '{json_bloom}' to proxy {ip[0]}:{ip[1]+1}...")
-                await write(proxy.w, json_bloom, True)
-            print("Sending CAI to neighbors...Done !")
+            sleep_time = await sendCAIs()
+            print('sleep time', sleep_time)
         time.sleep(sleep_time)
 
 
@@ -429,7 +499,7 @@ async def client_connected_cb(reader, writer):
         else:
             response = await proxy.treate_query(query)
             await write(writer, response)
-        print("Done !")
+        print("Reading query...Done!")
     
 
 async def read(reader):
