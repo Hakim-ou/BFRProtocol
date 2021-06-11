@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+from random import shuffle
 import sys
 import json
 import time
@@ -8,16 +9,15 @@ import calendar
 import threading
 import redis
 from probables import BloomFilter
+from collections import deque
+
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+                                    Configuration
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
 # Local address
 LOCAL_HOST = sys.argv[1]
 LOCAL_PORT = int(sys.argv[2])
-
-# bloom filters' dictionary
-bfs = dict()
-
-# local bloom standard name
-LOCAL_BLOOM = "bf:localBF"
 
 # local bloom old value
 BLOOM_UP_TO_DATE = True # no new data
@@ -25,10 +25,11 @@ BLOOM_UP_TO_DATE = True # no new data
 # initializing localBF
 FALSE_RATE = 0.01
 CAPACITY = 1000
-bfs[LOCAL_BLOOM] = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+LOCAL_BLOOM = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
 
+MAX_BFs_PER_NODE = 100
 # FIB
-# forme of entry: 'sourceID': {'currentNounce':nounce, 'nextHope':[ip, port], 'receivedNounces':set()}
+# forme of entry: 'sourceID': {'nextHope':[ip, port], 'receivedNounces':deque([], MAX_BFs_PER_NODE), 'bfs':deque([], MAX_BFs_PER_NODE)}
 FIB = dict()
 
 # load neighbors ip addresses.
@@ -43,6 +44,9 @@ with open("ips.txt", "r") as f:
 # it is not necessary, we can use the client provided by this proxy, but it is easier
 # and just as performant like that
 redis_client = redis.Redis(host=LOCAL_HOST, port=LOCAL_PORT)
+
+# time to sleep between CAIs
+SLEEP_TIME = 5 # TODO change to 1 second
 
 
 
@@ -378,21 +382,23 @@ class Proxy:
         # an advertisment before
         for sourceID in FIB.keys():
             # check if the node designated with 'sourceID' might have the information 
-            if bfs[f"bf:{sourceID}:{FIB[sourceID]['currentNounce']}"].check(key):
-                # if so, forward the request to the next hope
-                ip = FIB[sourceID]['nextHope']
-                print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
-                # TODO we would like to remove the await here, we ask for the content
-                # and with the first true positive we receive we cancel all the other requests
-                value, response = await self._forward_query(query, host=ip[0], port=ip[1]+1)
-                if value != -1:
-                    # if the bf hit was a true positive return the value and stop there
-                    print(f"Content found at {ip[0]}:{ip[1]} !")
-                    return value, response
-                else:
-                    # if the bf hit was a false positive log that and continue
-                    # to check the other nodes
-                    print(f"Content not found at {ip[0]}:{ip[1]} !")
+            for bf in FIB[sourceID]['bfs']:
+                if bf.check(key):
+                    # if so, forward the request to the next hope
+                    ip = FIB[sourceID]['nextHope']
+                    print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
+                    # TODO we would like to remove the await here, we ask for the content
+                    # and with the first true positive we receive we cancel all the other requests
+                    value, response = await self._forward_query(query, host=ip[0], port=ip[1]+1)
+                    if value != -1:
+                        # if the bf hit was a true positive return the value and stop there
+                        print(f"Content found at {ip[0]}:{ip[1]} !")
+                        return value, response
+                    else:
+                        # if the bf hit was a false positive log that and continue
+                        # to check the other nodes
+                        print(f"Content not found at {ip[0]}:{ip[1]} !")
+                        break
         print("Content not found...404")
         return value, response
 
@@ -417,7 +423,7 @@ class Proxy:
         if sourceID not in FIB.keys():
             # This is the first time we receive a CAI from the node identified with sourceID
             # so we need to create a new set of already recieved nounces
-            FIB[sourceID] = {'currentNounce': nounce, 'nextHope':[source_host, source_port], 'receivedNounces':{nounce}}
+            FIB[sourceID] = {'nextHope':[source_host, source_port], 'receivedNounces':deque([nounce], MAX_BFs_PER_NODE), 'bfs':deque([], MAX_BFs_PER_NODE)}
         else:
             # We already have an entry for this sourceID, so we have to check if this
             # is a new advertisement or it is just a cercular forwarding
@@ -429,13 +435,10 @@ class Proxy:
                 # if this is a new advertisement we will replace the old one with
                 # this one and we will add the nounce to the set of already received
                 # nounces.
-                print('received nounce', nounce)
-                print('old nounces', FIB[sourceID]['receivedNounces'])
-                FIB[sourceID]['currentNounce'] = nounce
-                FIB[sourceID]['receivedNounces'].add(nounce)
+                FIB[sourceID]['receivedNounces'].appendleft(nounce)
                 FIB[sourceID]['nextHope'] = [source_host, source_port]
         # reconstruct BF from bf_string and store it in the right place
-        restoreBF(bf_string, f"bf:{sourceID}:{nounce}")
+        restoreBF(bf_string, sourceID)
         print("Populating FIB...Done!")
         # forward CAI to neighbors, except the neighbor that sent us this CAI
         print(f"Forwarding FIB to neighboors...")
@@ -449,58 +452,40 @@ class Proxy:
                             CAIs and CARs producers
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-def saveBF(bloom=LOCAL_BLOOM):
+def chooseContent():
     """
-    dumps the local bloom to a hexadicimal string
-    representation
-
-    :param bloom: the name of the bloom filter to dump
+    Chooses randomlly 'CAPACITY' content from the set of contents
+    we possess and loads them into 'LOCAL_BLOOM' after clearing it.
+    If the number of contents we possess is less than 'CAPACITY' then
+    all the content is added to the 'LOCAL_BLOOM'. In this case, it's
+    very likely that the 'LOCAL_BLOOM' wont change, so we will set
+    'BLOOM_UP_TO_DATE' to date to true in order not to republish the
+    same content.
     """
-    try:
-        hex_string = bfs[bloom].export_hex()
-        return hex_string
-    except KeyError:
-        # if we have no bloom of this name we create an empty one
-        # and we log that for debuging
-        print(f"Can not save bf {bloom}. Reserving BF {bloom}...")
-        bfs[bloom] = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
-        saveBF(bloom)
-
-def checkForNews():
-    """
-    checks if there is any new keys in redis. In this case,
-    global variables BLOOM_UP_TO_DATE and bfs[LOCAL_BLOOM] are updated
-    """
-    print("Checking for new content...")
-    global BLOOM_UP_TO_DATE
-    # iterate over keys and BF.ADD them to local BF
-    # NB: This step wont be necessary when we'll have
-    #     control over writes (BF.ADD after evry write)
+    print("Choosing content to advertise...")
+    global BLOOM_UP_TO_DATE, LOCAL_BLOOM
     tmp = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
-    for key in redis_client.keys():
-        tmp.add(key.decode())
+    keys = list(redis_client.keys())
+    shuffle(keys)
+    for i in range(min(len(keys), CAPACITY)):
+        tmp.add(keys[i].decode())
     # check if there is a change compared to the old local bloom
-    if not bfs[LOCAL_BLOOM].jaccard_index(tmp) == 1:
-        bfs[LOCAL_BLOOM] = tmp
+    if not LOCAL_BLOOM.jaccard_index(tmp) == 1:
+        LOCAL_BLOOM = tmp
         BLOOM_UP_TO_DATE = False
     else:
         BLOOM_UP_TO_DATE = True
-    print("Checking for new content...Done!")
+    print("Choosing content to advertise...Done!")
 
-def restoreBF(bf_string, key):
+def restoreBF(bf_string, sourceID):
     """
     restores the bloom filter from the given hexadecimal
-    string representation
+    string representation and adds it to sourceID's BFs deque
 
     :param: bf_string hexa decimal string representation
-    :param: key the name to give to the BF
+    :param: sourceID the source of this bf
     """
-    # TODO If it is possible to receive multiple BFs from a node we should not
-    #      override the old one
-    bfs[key] = BloomFilter(hex_string=bf_string)
-
-# time to sleep between CAIs
-SLEEP_TIME = 5 # TODO change to 1 second
+    FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
 
 async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None):
     """
@@ -515,7 +500,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     print("Sending CAI to neighbors...")
     sleep_time = SLEEP_TIME
     # by default the CAI's bf is the bloom filter of our local content
-    bf = bf if bf is not None else bfs[LOCAL_BLOOM].export_hex()
+    bf = bf if bf is not None else LOCAL_BLOOM.export_hex()
     # we construct the json msg that will be sent
     json_bloom = {"code":"CAI", "sourceID":sourceID, "nounce":calendar.timegm(time.gmtime()), "nextHope":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":bf}
     json_bloom = json.dumps(json_bloom)
@@ -558,8 +543,9 @@ async def CAIsProducer():
     and sends update to neighbors if we found any
     """
     while True:
-        # check if there is new content in our local redis server
-        checkForNews()
+        # choose content from our local redis server to advertise
+        chooseContent()
+        # check that it is not the same as last time (TODO the last times)
         if not BLOOM_UP_TO_DATE:
         #if True:
             # schedule a task to send the CAIs
