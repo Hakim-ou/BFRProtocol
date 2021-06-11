@@ -2,13 +2,12 @@
 
 import asyncio
 import sys
-import base64
 import json
 import time
 import calendar
 import threading
 from redisbloom.client import Client
-from redis.exceptions import ResponseError
+import redis
 from probables import BloomFilter
 
 # Local address
@@ -22,7 +21,6 @@ bfs = dict()
 LOCAL_BLOOM = "bf:localBF"
 
 # local bloom old value
-BLOOM_DUMP = [] # table of chunks
 BLOOM_UP_TO_DATE = True # no new data
 
 # initializing localBF
@@ -32,17 +30,7 @@ bfs[LOCAL_BLOOM] = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_
 
 # RedisBloom Client, it will be used for results that we do not need to forward
 # TODO Change this to normal redis redis
-redis_client = Client(host=LOCAL_HOST, port=LOCAL_PORT)
-#try:
-#    print("Loading Redis Bloom...")
-#    redis_client.execute_command('MODULE LOAD', '/etc/redis/redisbloom.so')
-#except ResponseError:
-#    print("Redis Bloom is already loaded !")
-#try:
-#    print("Initializing local BF...")
-#    redis_client.execute_command('BF.RESERVE', LOCAL_BLOOM, '0.01', '1000')
-#except ResponseError as e:
-#    print("Local BF is already initialized!")
+redis_client = redis.Redis(host=LOCAL_HOST, port=LOCAL_PORT)
 
 # load neighbors ip addresses.
 ips = list()
