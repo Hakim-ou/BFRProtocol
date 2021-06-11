@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import asyncio
-import async_timeout
 import sys
 import base64
 import json
@@ -10,10 +9,14 @@ import calendar
 import threading
 from redisbloom.client import Client
 from redis.exceptions import ResponseError
+from probables import BloomFilter
 
 # Local address
 LOCAL_HOST = sys.argv[1]
 LOCAL_PORT = int(sys.argv[2])
+
+# bloom filters' dictionary
+bfs = dict()
 
 # local bloom standard name
 LOCAL_BLOOM = "bf:localBF"
@@ -22,18 +25,24 @@ LOCAL_BLOOM = "bf:localBF"
 BLOOM_DUMP = [] # table of chunks
 BLOOM_UP_TO_DATE = True # no new data
 
+# initializing localBF
+FALSE_RATE = 0.01
+CAPACITY = 1000
+bfs[LOCAL_BLOOM] = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+
 # RedisBloom Client, it will be used for results that we do not need to forward
+# TODO Change this to normal redis redis
 redis_client = Client(host=LOCAL_HOST, port=LOCAL_PORT)
-try:
-    print("Loading Redis Bloom...")
-    redis_client.execute_command('MODULE LOAD', '/etc/redis/redisbloom.so')
-except ResponseError:
-    print("Redis Bloom is already loaded !")
-try:
-    print("Initializing local BF...")
-    redis_client.execute_command('BF.RESERVE', LOCAL_BLOOM, '0.01', '1000')
-except ResponseError as e:
-    print("Local BF is already initialized!")
+#try:
+#    print("Loading Redis Bloom...")
+#    redis_client.execute_command('MODULE LOAD', '/etc/redis/redisbloom.so')
+#except ResponseError:
+#    print("Redis Bloom is already loaded !")
+#try:
+#    print("Initializing local BF...")
+#    redis_client.execute_command('BF.RESERVE', LOCAL_BLOOM, '0.01', '1000')
+#except ResponseError as e:
+#    print("Local BF is already initialized!")
 
 # load neighbors ip addresses.
 ips = list()
@@ -276,13 +285,13 @@ class PushBasedProxy:
         TODO
         """
         print("Treating JSON query...")
-        bloom_chunks = json.loads(query[1:-2].decode()) # query starts with 'J' and ends with '\r\n'
-        source_host, source_port = str(bloom_chunks["nextHope"]).split(":")
+        msg = json.loads(query[1:-2].decode()) # query starts with 'J' and ends with '\r\n'
+        source_host, source_port = str(msg["nextHope"]).split(":")
         source_port = int(source_port)
-        sourceID = bloom_chunks["sourceID"] 
-        nounce = bloom_chunks["nounce"]
-        bloom_chunks = bloom_chunks['bf']
-        await self._populateFIB(sourceID, nounce, source_host, source_port, bloom_chunks)
+        sourceID = msg["sourceID"] 
+        nounce = msg["nounce"]
+        bf_string = msg['bf']
+        await self._populateFIB(sourceID, nounce, source_host, source_port, bf_string)
         print("Treating JSON query...Done!")
 
     
@@ -329,7 +338,8 @@ class PushBasedProxy:
         """
         value, response = -1, b'$-1\r\n'
         for sourceID in FIB.keys():
-            if redis_client.bfExists(f"bf:{sourceID}:{FIB[sourceID]['currentNounce']}", key):
+            #if redis_client.bfExists(f"bf:{sourceID}:{FIB[sourceID]['currentNounce']}", key):
+            if bfs[f"bf:{sourceID}:{FIB[sourceID]['currentNounce']}"].check(key):
                 ip = FIB[sourceID]['nextHope']
                 print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
                 # send request to redis ip
@@ -342,7 +352,7 @@ class PushBasedProxy:
         print("Content not found...404")
         return value, response
 
-    async def _populateFIB(self, sourceID, nounce, source_host, source_port, bloom_chunks):
+    async def _populateFIB(self, sourceID, nounce, source_host, source_port, bf_string):
         """
         TODO
         """
@@ -362,11 +372,11 @@ class PushBasedProxy:
                 FIB[sourceID]['currentNounce'] = nounce
                 FIB[sourceID]['receivedNounces'].add(nounce)
                 FIB[sourceID]['nextHope'] = [source_host, source_port]
-        restoreBF(bloom_chunks, f"bf:{sourceID}:{nounce}")
+        restoreBF(bf_string, f"bf:{sourceID}:{nounce}")
         print("Populating FIB...Done!")
         # forward CAI to neighbors, except the neighbor that sent us this CAI
         print(f"Forwarding FIB to neighboors...")
-        await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bloom_chunks)
+        await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string)
         print(f"Forwarding FIB to neighbors...Done!")
 
 
@@ -378,69 +388,59 @@ class PushBasedProxy:
 
 def saveBF(bloom=LOCAL_BLOOM):
     """
-    dumps the local bloom. Multiple chunks are used in case
-    the BF is too large to be SAVEd in one chunk
+    dumps the local bloom to a hexadicimal string
+    representation
     """
-    chunks = []
-    itera = 0
-    while True:
-        try:
-            itera, data = redis_client.bfScandump(bloom, itera)
-        except ResponseError:
-            print(f"Can not save bf {bloom}. Reserving BF {bloom}...")
-        if itera == 0:
-            return chunks
-        else:
-            chunks.append([itera, base64.b64encode(data).decode('ascii')])
+    try:
+        hex_string = bfs[bloom].export_hex()
+        return hex_string
+    except KeyError:
+        print(f"Can not save bf {bloom}. Reserving BF {bloom}...")
+        bfs[bloom] = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+        saveBF(bloom)
 
 def checkForNews():
     """
     checks if there is any new keys in redis. In this case,
-    global variables BLOOM_UP_TO_DATE and BLOOM_DUMP are updated
+    global variables BLOOM_UP_TO_DATE and bfs[LOCAL_BLOOM] are updated
     """
     print("Checking for new content...")
-    global BLOOM_DUMP, BLOOM_UP_TO_DATE
+    global BLOOM_UP_TO_DATE
     # iterate over keys and BF.ADD them to local BF
     # NB: This step wont be necessary when we'll have
     #     control over writes (BF.ADD after evry write)
+    tmp = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
     for key in redis_client.keys():
         if not (str(key).startswith("b'bf:") or str(key).startswith("b'ts:")):
-            try:
-                redis_client.bfAdd(LOCAL_BLOOM, key)
-            except ResponseError:
-                print("BF {} does not exist. Creating it...")
-                redis_client.bfInsert(LOCAL_BLOOM, key, capacity=1000, error=0.01)
-                print("Creating it...Done!")
-    new_dump = saveBF()
-
-    if (len(new_dump) != len(BLOOM_DUMP)) or any((new_dump[i][1] != BLOOM_DUMP[i][1] for i in range(len(new_dump)))):
-            BLOOM_UP_TO_DATE = False
-            BLOOM_DUMP = new_dump
+            tmp.add(key.decode())
+    # check if there is a change compared to the old local bloom
+    if not bfs[LOCAL_BLOOM].jaccard_index(tmp) == 1:
+        bfs[LOCAL_BLOOM] = tmp
+        BLOOM_UP_TO_DATE = False
     else:
         BLOOM_UP_TO_DATE = True
     print("Checking for new content...Done!")
 
-def restoreBF(chunks, key):
+def restoreBF(bf_string, key):
     """
-    restores the given chunks in redis under the given key name
+    restores the bloom filter from the given hexadecimal
+    string representation
 
-    :param: chunks the data to restore in the BF
+    :param: bf_string hexa decimal string representation
     :param: key the name to give to the BF
     """
-    for chunk in chunks:
-        itera, data = chunk
-        redis_client.bfLoadChunk(key, itera, base64.b64decode(data))
+    bfs[key] = BloomFilter(hex_string=bf_string)
 
 # time to sleep between CAIs
 SLEEP_TIME = 5 # TODO change to 1 second
 
-async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=[]):
+async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None):
     """
     Sends CAIs to neighboors with 'sourceID'=sourceID
     """
     print("Sending CAI to neighbors...")
     sleep_time = SLEEP_TIME
-    bf = bf if len(bf) > 0 else BLOOM_DUMP
+    bf = bf if bf is not None else bfs[LOCAL_BLOOM].export_hex()
     json_bloom = {"code":"CAI", "sourceID":sourceID, "nounce":calendar.timegm(time.gmtime()), "nextHope":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":bf}
     json_bloom = json.dumps(json_bloom)
     proxy = PushBasedProxy()
@@ -449,6 +449,10 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         if (ip[0] == LOCAL_HOST and ip[1] == LOCAL_PORT)\
              or (ip[0] == nextHope[0] and ip[1] == nextHope[1]):
             continue
+        else:
+            print("sending to host", ip[0], "port", ip[1])
+            print("local host", LOCAL_HOST, "port", LOCAL_PORT)
+            print("next hope", nextHope[0], "port", nextHope[1])
         print(f"Sending CAI to {ip[0]}:{ip[1]}...")
         await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
         if not proxy.connected:
