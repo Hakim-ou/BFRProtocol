@@ -546,17 +546,13 @@ async def CAIsProducer():
         # choose content from our local redis server to advertise
         chooseContent()
         # check that it is not the same as last time (TODO the last times)
+        sleep_time = SLEEP_TIME
         if not BLOOM_UP_TO_DATE:
         #if True:
-            # schedule a task to send the CAIs
-            # TODO I have some lack of understanding here
-            #      Normally I should wait for this to end
-            #      but waiting for it blocks the thread
-            # TODO This have to reduce the sleep time if
-            #      we missed some connections
-            asyncio.create_task(sendCAIs())
-        print('Going to sleep')
-        await asyncio.sleep(SLEEP_TIME)
+            # wait for CAIs to be sent and recuperate sleep_time
+            sleep_time = await sendCAIs()
+        print(f"Going to sleep for {sleep_time} seconds")
+        await asyncio.sleep(sleep_time)
 
 
 
