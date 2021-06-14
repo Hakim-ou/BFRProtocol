@@ -281,6 +281,36 @@ class Proxy:
                                                         # 'MODULE LOAD' (but they are not GET-like
                                                         # commands, so no problem
 
+    def _treat_CAR_query(bf):
+        """
+        Checks if we have any of the requested content.
+
+        After that we are not sure if we satisfied all
+        needs or there are still contents that are
+        requested and taht we do not possess. There are
+        two solutions:
+        1) forward CAR to neighbors any way (with a nounce
+           to avoid dup, so we'll stop when everybody
+           receives the CAR)
+        2) respond with what we got and let the requester
+           update its CAR if there are more files it needs.
+        
+        Here we implement the first solution
+        """
+        # check if we have any of the requested content
+        availibleContent = set()
+        for key in redis_client.keys():
+            if bf.check(key):
+                availibleContent.add(key)
+
+        # forward CAR to neighbors any way (with a nounce
+        # to avoid dup, so we'll stop when everybody
+        # receives the CAR)
+        # TODO
+        
+        
+
+
     async def treate_query(self, query):
         """
         This function will treat all redis queries, decide
