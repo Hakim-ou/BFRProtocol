@@ -281,33 +281,6 @@ class Proxy:
                                                         # 'MODULE LOAD' (but they are not GET-like
                                                         # commands, so no problem
 
-    def _treat_CAR_query(bf):
-        """
-        Checks if we have any of the requested content.
-
-        After that we are not sure if we satisfied all
-        needs or there are still contents that are
-        requested and taht we do not possess. There are
-        two solutions:
-        1) forward CAR to neighbors any way (with a nounce
-           to avoid dup, so we'll stop when everybody
-           receives the CAR)
-        2) respond with what we got and let the requester
-           update its CAR if there are more files it needs.
-        
-        Here we implement the first solution
-        """
-        # check if we have any of the requested content
-        availibleContent = set()
-        for key in redis_client.keys():
-            if bf.check(key):
-                availibleContent.add(key)
-
-        # forward CAR to neighbors any way (with a nounce
-        # to avoid dup, so we'll stop when everybody
-        # receives the CAR)
-        # TODO
-        
         
 
 
@@ -347,8 +320,14 @@ class Proxy:
         sourceID = msg["sourceID"] 
         nounce = msg["nounce"]
         bf_string = msg['bf']
-        # populate FIB and forward to neighbors
-        await self._populateFIB(sourceID, nounce, source_host, source_port, bf_string)
+        code = msg['code']
+        if code == "CAI":
+            # populate FIB and forward to neighbors
+            await self._populateFIB(sourceID, nounce, source_host, source_port, bf_string)
+        elif code == "CAR":
+            await self._treat_CAR_query(sourceID, bf_string, source_host, source_port)
+        else:
+            print("Unknown code...Droping message!")
         print("Treating JSON query...Done!")
 
     
@@ -475,6 +454,44 @@ class Proxy:
         await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string)
         print(f"Forwarding FIB to neighbors...Done!")
 
+    async def _treat_CAR_query(self, sourceID, bf_string, source_host, source_port):
+        """
+        Checks if we have any of the requested content
+        and reply with a CAI of what we possess
+
+        After that we are not sure if we satisfied all
+        needs or there are still contents that are
+        requested and taht we do not possess. There are
+        two solutions:
+        1) forward CAR to neighbors any way (with a nounce
+           to avoid dup, so we'll stop when everybody
+           receives the CAR)
+        2) respond with what we got and let the requester
+           update its CAR if there are more files it needs.
+        
+        Here we implement the first solution
+        """
+        bf = BloomFilter(hex_string=bf_string)
+        # check if we have any of the requested content
+        availibleContent = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+        notEmpty = False
+        for key in redis_client.keys():
+            if bf.check(key.decode()):
+                availibleContent.add(key.decode())
+                notEmpty = True
+        # send CAI to requester
+        if notEmpty:
+            await sendCAIs(bf=bf.export_hex(), sendTo=[source_host, source_port])
+        # forward CAR to neighbors
+        await sendCARs(sourceID, nextHope=[source_host, source_port], bf=bf.export_hex())
+            
+
+
+        # forward CAR to neighbors any way (with a nounce
+        # to avoid dup, so we'll stop when everybody
+        # receives the CAR)
+        # TODO
+        
 
 
 
@@ -517,22 +534,24 @@ def restoreBF(bf_string, sourceID):
     """
     FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
 
-async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None):
+async def sendBF(code, sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None, sendTo=None):
     """
-    Sends CAIs to neighboors with 'sourceID'=sourceID
+    Sends the specified bf, or LOCAL_BLOOM if bf is None, to neighboors with 
+    'sourceID'=sourceID. The code indicates the type of the BF. If 'sendTo' is not None, it is
+    supposed to be of form [host, ip] and only the corresponding node will receive the CAI.
 
     :param sourceID: the source of the CAI. By default it is the current node, but if we are
             forwarding a CAI it will be different
     :param nextHope: the neighbor from which we received this CAI. We must know it to avoid
             resending the CAI to it
-    :param bf: the CAI's bloom filter
+    :param bf: the bloom filter
     """
-    print("Sending CAI to neighbors...")
+    print(f"Sending {code} to neighbors...")
     sleep_time = SLEEP_TIME
-    # by default the CAI's bf is the bloom filter of our local content
+    # by default the bf is the bloom filter of our local content
     bf = bf if bf is not None else LOCAL_BLOOM.export_hex()
     # we construct the json msg that will be sent
-    json_bloom = {"code":"CAI", "sourceID":sourceID, "nounce":calendar.timegm(time.gmtime()), "nextHope":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":bf}
+    json_bloom = {"code":code, "sourceID":sourceID, "nounce":calendar.timegm(time.gmtime()), "nextHope":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":bf}
     json_bloom = json.dumps(json_bloom)
     # we instanciate a Proxy to use its communication features to communicate
     # with the neighbors
@@ -542,12 +561,15 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     # time from the sleep time if the connection fails
     timeout = sleep_time / len(ips) if len(ips) != 0 else sleep_time
     for ip in ips:
+        if sendTo is not None and (ip[0] != sendTo[0] or ip[1] != sendTo[1]):
+            # if the receiver is specified than ignore all the other neighbors
+            continue
         if (ip[0] == LOCAL_HOST and ip[1] == LOCAL_PORT)\
              or (ip[0] == nextHope[0] and ip[1] == nextHope[1]):
-            # avoid sending the CAI to ourselves or to the neighbor that
+            # avoid sending the BF to ourselves or to the neighbor that
             # forwarded this information to us
             continue
-        print(f"Sending CAI to {ip[0]}:{ip[1]}...")
+        print(f"Sending {code} to {ip[0]}:{ip[1]}...")
         # connect with timeout to the node designated with 'ip'
         await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
         if not proxy.connected:
@@ -563,9 +585,15 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]+1}...")
         # wait for the write to complete
         await write(proxy.w, json_bloom, True)
-        print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
-    print("Sending CAI to neighbors...Done !")
+        print(f"Sending {code} to {ip[0]}:{ip[1]}...Done!")
+    print(f"Sending {code} to neighbors...Done!")
     return sleep_time
+
+async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None, sendTo=None):
+    return await sendBF("CAI", sourceID, nextHope, bf, sendTo)
+
+async def sendCARs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None, sendTo=None):
+    await sendBF("CAR", sourceID, nextHope, bf, sendTo)
 
 async def CAIsProducer():
     """
