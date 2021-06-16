@@ -1,0 +1,62 @@
+version: "3"
+
+services:
+  redis1:
+    image: redis
+
+  proxy1:
+    build: ./dockerfiles/
+    expose:
+      - "8080"
+    volumes:
+      - ./proxy:/proxy
+    depends_on: 
+      - redis1
+    environment: 
+      - LOCAL_HOST=bfrprotocol_proxy1_1
+      - LOCAL_PORT=8080
+      - REDIS_HOST=bfrprotocol_redis1_1
+      - REDIS_PORT=6379
+      - NB_NEIGHBORS=2
+      - NEIGHBOR1=bfrprotocol_proxy3_1
+      - NEIGHBOR2=bfrprotocol_proxy2_1
+
+  redis2:
+    image: redis
+
+  proxy2:
+    build: ./dockerfiles/
+    expose:
+      - "8080"
+    volumes:
+      - ./proxy:/proxy
+    depends_on: 
+      - redis2
+    environment: 
+      - LOCAL_HOST=bfrprotocol_proxy2_1
+      - LOCAL_PORT=8080
+      - REDIS_HOST=bfrprotocol_redis2_1
+      - REDIS_PORT=6379
+      - NB_NEIGHBORS=2
+      - NEIGHBOR1=bfrprotocol_proxy1_1
+      - NEIGHBOR2=bfrprotocol_proxy3_1
+  
+  redis3:
+    image: redis
+
+  proxy3:
+    build: ./dockerfiles/
+    expose:
+      - "8080"
+    volumes:
+      - ./proxy:/proxy
+    depends_on: 
+      - redis3
+    environment: 
+      - LOCAL_HOST=bfrprotocol_proxy3_1
+      - LOCAL_PORT=8080
+      - REDIS_HOST=bfrprotocol_redis3_1
+      - REDIS_PORT=6379
+      - NB_NEIGHBORS=2
+      - NEIGHBOR1=bfrprotocol_proxy1_1
+      - NEIGHBOR2=bfrprotocol_proxy2_1
