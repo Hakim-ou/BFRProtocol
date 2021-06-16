@@ -18,12 +18,14 @@ from collections import deque
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
 # Local address
-#LOCAL_HOST = sys.argv[1]
-#LOCAL_PORT = int(sys.argv[2])
-LOCAL_HOST = os.environ['LOCAL_HOST']
-REDIS_HOST = os.environ['REDIS_HOST']
-LOCAL_PORT = int(os.environ['LOCAL_PORT'])
-REDIS_PORT = int(os.environ['REDIS_PORT'])
+LOCAL_HOST = sys.argv[1]
+LOCAL_PORT = int(sys.argv[2]) + 1
+REDIS_HOST = LOCAL_HOST
+REDIS_PORT = LOCAL_PORT - 1
+#LOCAL_HOST = os.environ['LOCAL_HOST']
+#REDIS_HOST = os.environ['REDIS_HOST']
+#LOCAL_PORT = int(os.environ['LOCAL_PORT'])
+#REDIS_PORT = int(os.environ['REDIS_PORT'])
 
 # local bloom old value
 BLOOM_UP_TO_DATE = True # no new data
@@ -39,16 +41,16 @@ MAX_BFs_PER_NODE = 100
 FIB = dict()
 
 # load neighbors ip addresses.
-STANDARD_PORT = 8080
-STANDARD_DB = 1
+#STANDARD_PORT = 8080
+#STANDARD_DB = 1
 ips = list()
-#with open("ips.txt", "r") as f:
-#    for line in f:
-#        adr = line.strip()
-#        ip, port, db = adr.split(":")
-#        ips.append([ip, int(port), int(db)])
-for i in range(int(os.environ['NB_NEIGHBORS'])):
-    ips.append([os.environ[f"NEIGHBOR{i+1}"], STANDARD_PORT, STANDARD_DB])
+with open("ips.txt", "r") as f:
+    for line in f:
+        adr = line.strip()
+        ip, port, db = adr.split(":")
+        ips.append([ip, int(port), int(db)])
+#for i in range(int(os.environ['NB_NEIGHBORS'])):
+#    ips.append([os.environ[f"NEIGHBOR{i+1}"], STANDARD_PORT, STANDARD_DB])
 
 # this redis client will be used to check if there is anything new in the redis server
 # it is not necessary, we can use the client provided by this proxy, but it is easier
@@ -398,7 +400,7 @@ class Proxy:
             cascading cancellation
             """
             task = tasks.pop()
-            if task == except_task:
+            if task == except_task and len(tasks) != 0:
                 # if we cancel current task we'll be stuck at this point
                 task = tasks.pop()
             task.cancel()
@@ -436,7 +438,8 @@ class Proxy:
                     #    # to check the other nodes
                     #    print(f"Content not found at {ip[0]}:{ip[1]} !")
                     #    break
-        print("Content not found...404")
+        if self.value == -1:
+            print("Content not found...404")
         return self.value, self.response
 
     async def _populateFIB(self, sourceID, nounce, source_host, source_port, bf_string):
@@ -481,7 +484,6 @@ class Proxy:
         print(f"Forwarding FIB to neighboors...")
         await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string)
         print(f"Forwarding FIB to neighbors...Done!")
-
 
 
 
