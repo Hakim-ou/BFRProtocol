@@ -46,7 +46,7 @@ ips = list()
 STANDARD_PORT = 8080
 STANDARD_BD = 1
 for i in range(int(os.environ['NB_NEIGHBORS'])):
-    ips.append([os.environ[f'NEIGHBOR{i}', STANDARD_PORT, STANDARD_BD]])
+    ips.append([os.environ[f'NEIGHBOR{i+1}'], STANDARD_PORT, STANDARD_BD])
 
 # this redis client will be used to check if there is anything new in the redis server
 # it is not necessary, we can use the client provided by this proxy, but it is easier
@@ -512,6 +512,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     # we construct the json msg that will be sent
     json_bloom = {"code":"CAI", "sourceID":sourceID, "nounce":calendar.timegm(time.gmtime()), "nextHope":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":bf}
     json_bloom = json.dumps(json_bloom)
+    json_bloom = b'J' + json_bloom.encode() + b'\r\n'
     # we instanciate a Proxy to use its communication features to communicate
     # with the neighbors
     proxy = Proxy()
@@ -537,7 +538,6 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
             continue
         print("connected")
         # format the msg so we can identify that it is a JSON msg
-        json_bloom = b'J' + json_bloom.encode() + b'\r\n'
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
         await write(proxy.w, json_bloom, True)
