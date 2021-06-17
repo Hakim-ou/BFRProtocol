@@ -2,7 +2,7 @@
 
 import asyncio
 from random import shuffle
-import sys
+import sys, os
 import json
 import time
 import calendar
@@ -16,8 +16,14 @@ from collections import deque
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
 # Local address
-LOCAL_HOST = sys.argv[1]
-LOCAL_PORT = int(sys.argv[2])
+#REDIS_HOST = sys.argv[1]
+#REDIS_PORT = int(sys.argv[2])
+#LOCAL_HOST = REDIS_HOST
+#LOCAL_PORT = REDIS_PORT + 1
+REDIS_HOST = os.environ['REDIS_HOST']
+REDIS_PORT = os.environ['REDIS_PORT']
+LOCAL_HOST = os.environ['LOCAL_HOST']
+LOCAL_PORT = os.environ['LOCAL_PORT']
 
 # local bloom old value
 BLOOM_UP_TO_DATE = True # no new data
@@ -34,11 +40,15 @@ FIB = dict()
 
 # load neighbors ip addresses.
 ips = list()
-with open("ips.txt", "r") as f:
-    for line in f:
-        adr = line.strip()
-        ip, port, db = adr.split(":")
-        ips.append([ip, int(port), int(db)])
+#with open("ips.txt", "r") as f:
+#    for line in f:
+#        adr = line.strip()
+#        ip, port, db = adr.split(":")
+#        ips.append([ip, int(port), int(db)])
+STANDARD_PORT = 8080
+STANDARD_BD = 1
+for i in range(int(os.environ['NB_NEIGHBORS'])):
+    ips.append([os.environ[f'NEIGHBOR{i+1}'], STANDARD_PORT, STANDARD_BD])
 
 # this redis client will be used to check if there is anything new in the redis server
 # it is not necessary, we can use the client provided by this proxy, but it is easier
@@ -553,6 +563,7 @@ async def sendBF(code, sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HO
     # we construct the json msg that will be sent
     json_bloom = {"code":code, "sourceID":sourceID, "nounce":calendar.timegm(time.gmtime()), "nextHope":f"{LOCAL_HOST}:{LOCAL_PORT}", "bf":bf}
     json_bloom = json.dumps(json_bloom)
+    json_bloom = b'J' + json_bloom.encode() + b'\r\n'
     # we instanciate a Proxy to use its communication features to communicate
     # with the neighbors
     proxy = Proxy()
@@ -581,7 +592,6 @@ async def sendBF(code, sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HO
             continue
         print("connected")
         # format the msg so we can identify that it is a JSON msg
-        json_bloom = b'J' + json_bloom.encode() + b'\r\n'
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]+1}...")
         # wait for the write to complete
         await write(proxy.w, json_bloom, True)
