@@ -8,6 +8,8 @@ services:
     build: ./dockerfiles/
     expose:
       - "8080"
+    ports:
+      - "6380:8080"
     volumes:
       - ./proxy:/proxy
     depends_on: 
