@@ -51,7 +51,8 @@ for i in range(int(os.environ['NB_NEIGHBORS'])):
 # this redis client will be used to check if there is anything new in the redis server
 # it is not necessary, we can use the client provided by this proxy, but it is easier
 # and just as performant like that
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+#redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+POOL = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT)
 
 # time to sleep between CAIs
 SLEEP_TIME = 5 # TODO change to 1 second
@@ -88,13 +89,11 @@ class Proxy:
         Connect to a host (another node or redis server)
         """
         print(f"Connecting to {host}:{port} ...")
-        await self.disconnect()
+        #await self.disconnect()
         self.r, self.w = await asyncio.open_connection(host=host, port=port)
         self.connected = True
         if task is not None:
             task.cancel()
-        else:
-            print(task)
         print(f"Connecting to {host}:{port} ...Done!")
 
     async def disconnect(self):
@@ -116,7 +115,7 @@ class Proxy:
         skip connection
         """
         print(f"Connecting to {host}:{port} with timeout {timeout} ...")
-        await self.disconnect()
+        #await self.disconnect()
         timing = asyncio.create_task(asyncio.sleep(timeout))
         connection = asyncio.create_task(self.connect(host, port, timing))
         try:
@@ -239,11 +238,12 @@ class Proxy:
         """
         print(f"Forwarding query to {host}:{port} ...")
         await self.connect(host, port)
-        print(f"Writing '{query}' to redis...")
+        print(f"Writing '{query}' to {host}:{port}...")
         self.w.write(query)
         await self.w.drain()
-        print(f"Writing '{query}' to redis...Done!")
+        print(f"Writing '{query}' to {host}:{port}...Done!")
         response = await self._read_redis_answer()
+        self.disconnect()
         print(f"Forwarding query to {host}:{port} ...Done!")
         return response
 
@@ -473,6 +473,7 @@ def chooseContent():
     print("Choosing content to advertise...")
     global BLOOM_UP_TO_DATE, LOCAL_BLOOM
     tmp = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+    redis_client = redis.StrictRedis(connection_pool=POOL)
     keys = list(redis_client.keys())
     shuffle(keys)
     for i in range(min(len(keys), CAPACITY)):
@@ -495,6 +496,7 @@ def restoreBF(bf_string, sourceID):
     """
     FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
 
+CAIS_PROXY = Proxy()
 async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None):
     """
     Sends CAIs to neighboors with 'sourceID'=sourceID
@@ -515,7 +517,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     json_bloom = b'J' + json_bloom.encode() + b'\r\n'
     # we instanciate a Proxy to use its communication features to communicate
     # with the neighbors
-    proxy = Proxy()
+    proxy = CAIS_PROXY
     # we define a timeout for connection equal to the 'SLEEP_TIME' devided
     # by the number of neighbors we have, because we entend to reduce this
     # time from the sleep time if the connection fails
@@ -541,6 +543,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
         await write(proxy.w, json_bloom, True)
+        await proxy.disconnect()
         print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
     print("Sending CAI to neighbors...Done !")
     return sleep_time
@@ -595,6 +598,7 @@ async def client_connected_cb(reader, writer):
         else:
             response = await proxy.treate_query(query)
             await write(writer, response)
+            return
         print("Reading query...Done!")
     
 
