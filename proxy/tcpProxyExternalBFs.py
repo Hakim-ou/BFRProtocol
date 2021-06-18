@@ -401,6 +401,7 @@ class Proxy:
             """
             cascading cancellation
             """
+            print("Cascad canselling task...")
             task = tasks.pop()
             if task == except_task and len(tasks) != 0:
                 # if we cancel current task we'll be stuck at this point
