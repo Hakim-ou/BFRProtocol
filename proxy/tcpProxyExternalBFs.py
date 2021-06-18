@@ -53,7 +53,7 @@ for i in range(int(os.environ['NB_NEIGHBORS'])):
 # this redis client will be used to check if there is anything new in the redis server
 # it is not necessary, we can use the client provided by this proxy, but it is easier
 # and just as performant like that
-redis_client = redis.Redis(host=LOCAL_HOST, port=LOCAL_PORT)
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
 
 # time to sleep between CAIs
 SLEEP_TIME = 5 # TODO change to 1 second
@@ -85,7 +85,7 @@ class Proxy:
         """
         self.connected = False
 
-    async def connect(self, host=LOCAL_HOST, port=LOCAL_PORT, task=None):
+    async def connect(self, host=REDIS_HOST, port=REDIS_PORT, task=None):
         """
         Connect to a host (another node or redis server)
         """
@@ -112,7 +112,7 @@ class Proxy:
         print("Disconnecting proxy's connections...Done!")
 
 
-    async def connectTO(self, host=LOCAL_HOST, port=LOCAL_PORT, timeout=1):
+    async def connectTO(self, host=REDIS_HOST, port=REDIS_PORT, timeout=1):
         """
         Connect to a host and if the connection takes longer then timeout
         skip connection
@@ -227,7 +227,7 @@ class Proxy:
                 query treatement
     """""""""""""""""""""""""""""""""""""""""""""
 
-    async def _forward_query(self, query, host=LOCAL_HOST, port=LOCAL_PORT):
+    async def _forward_query(self, query, host=REDIS_HOST, port=REDIS_PORT):
         """
         Sends the query as it is to redis server designed by 'host' and  'port'
         The return value is a list of 2 elements:
@@ -349,7 +349,7 @@ class Proxy:
     TODO Incomplete
     """""""""""""""""""""""""""""""""""""""""""""
 
-    async def _get_query(self, key, host=LOCAL_HOST, port=LOCAL_PORT):
+    async def _get_query(self, key, host=REDIS_HOST, port=REDIS_PORT):
         """
         Implements a redis get or mget query. An mget query
         will be executed if key is not a string
@@ -370,7 +370,7 @@ class Proxy:
             print(f"MGET {key} answered {response.decode()}")
             return response
         
-    async def _bfExists_query(self, bfName, key, host=LOCAL_HOST, port=LOCAL_PORT):
+    async def _bfExists_query(self, bfName, key, host=REDIS_HOST, port=REDIS_PORT):
         """
         Implements a redis get or mget query. An mget query
         will be executed if key is a list
@@ -408,7 +408,7 @@ class Proxy:
                     print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
                     # TODO we would like to remove the await here, we ask for the content
                     # and with the first true positive we receive we cancel all the other requests
-                    value, response = await self._forward_query(query, host=ip[0], port=ip[1]+1)
+                    value, response = await self._forward_query(query, host=ip[0], port=ip[1])
                     if value != -1:
                         # if the bf hit was a true positive return the value and stop there
                         print(f"Content found at {ip[0]}:{ip[1]} !")
@@ -582,7 +582,7 @@ async def sendBF(code, sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HO
             continue
         print(f"Sending {code} to {ip[0]}:{ip[1]}...")
         # connect with timeout to the node designated with 'ip'
-        await proxy.connectTO(host=ip[0], port=ip[1]+1, timeout=timeout)
+        await proxy.connectTO(host=ip[0], port=ip[1], timeout=timeout)
         if not proxy.connected:
             print("not connected")
             # reduce the time taken by the failed connection from sleep time
@@ -592,7 +592,7 @@ async def sendBF(code, sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HO
             continue
         print("connected")
         # format the msg so we can identify that it is a JSON msg
-        print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]+1}...")
+        print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
         await write(proxy.w, json_bloom, True)
         print(f"Sending {code} to {ip[0]}:{ip[1]}...Done!")
@@ -704,7 +704,7 @@ async def server():
     """
     A coroutine that lunches the proxy server
     """
-    server = await asyncio.start_server(client_connected_cb, host=LOCAL_HOST, port=LOCAL_PORT+1)
+    server = await asyncio.start_server(client_connected_cb, host=LOCAL_HOST, port=LOCAL_PORT)
     async with server:
         await server.serve_forever()
 
