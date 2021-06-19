@@ -10,7 +10,7 @@ PROXY_PORT = int(os.environ['PROXY_PORT'])
 async def main():
 	consumer = Client(PROXY_HOST, PROXY_PORT)
 	# generate content
-	NB_CONTENT = 1000 #TODO make it 1M
+	NB_CONTENT = 10000 #TODO make it 1M
 	exectimes = dict()
 	for id in PRODUCERS_IDS:
 		start_time = time.time()

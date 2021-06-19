@@ -51,8 +51,8 @@ for i in range(int(os.environ['NB_NEIGHBORS'])):
 # this redis client will be used to check if there is anything new in the redis server
 # it is not necessary, we can use the client provided by this proxy, but it is easier
 # and just as performant like that
-#redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-POOL = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT)
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+#POOL = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT)
 
 # time to sleep between CAIs
 SLEEP_TIME = 5 # TODO change to 1 second
@@ -83,6 +83,8 @@ class Proxy:
         Initialize the proxy to not being connected to any other host (not even redis server)
         """
         self.connected = False
+        self.connectedToRedis = False
+        self.r, self.w, self.redisR, self.redisW = None, None, None, None
 
     async def connect(self, host=REDIS_HOST, port=REDIS_PORT, task=None):
         """
@@ -100,12 +102,12 @@ class Proxy:
         """
         Disconnect from the current connection designed by self.w
         """
-        if not self.connected:
-            return
         print("Disconnecting proxy's connections...")
-        self.w.close()
-        await self.w.wait_closed()
-        self.connected = False
+        if self.w is not None:
+            self.w.close()
+            await self.w.wait_closed()
+            self.connected = False
+            self.w, self.r = None, None
         print("Disconnecting proxy's connections...Done!")
 
 
@@ -127,93 +129,117 @@ class Proxy:
         except asyncio.CancelledError:
             print(f"Connecting to {host}:{port} with timeout {timeout} ...Done!")
 
+    async def connectToRedis(self):
+        """
+        Preseve a single connection to redis for the totality of the communication
+        """
+        print(f"Connecting to redis ...")
+        self.redisR, self.redisW = await asyncio.open_connection(host=REDIS_HOST, port=REDIS_PORT)
+        self.connectedToRedis = True
+        print(f"Connecting to redis...Done!")
+
+    async def disconnectRedis(self):
+        """
+        Close connection with redis
+        """
+        print("Disconnecting from redis...")
+        if self.redisW is not None:
+            self.redisW.close()
+            await self.redisW.wait_closed()
+            self.connected = False
+            self.redisW, self.redisR = None, None
+        print("Disconnecting from redis...Done!")
+        
+        
+
     """""""""""""""""""""""""""""""""""""""""""""
                 redis read operations
     """""""""""""""""""""""""""""""""""""""""""""
 
-    async def _read_redis_answer(self):
+    async def _read_redis_answer(self, reader):
         """
         This function allow us to read answers from redis, respecting the
         RESP protocole
         """
         print("Reading reply...")
-        ch = await self.r.read(1)
+        ch = await reader.read(1)
         bruteAnswer = ch
         if ch == b'$':
-            tmp = await self._read_bluk()
+            tmp = await self._read_bluk(reader)
             response = tmp[0]
             bruteAnswer += tmp[1]
         elif ch == b'+':
-            tmp = await self._read_simple_string()
+            tmp = await self._read_simple_string(reader)
             response = tmp[0]
             bruteAnswer += tmp[1]
         elif ch == b'-':
-            tmp = await self._read_simple_string()
+            tmp = await self._read_simple_string(reader)
             response = tmp[0].split(" ", 1)
             response = {"error":response[0], "msg":response[1] if len(response) > 1 else ""}
             bruteAnswer += tmp[1]
         elif ch == b':':
-            tmp = await self._read_int()
+            tmp = await self._read_int(reader)
             response = tmp[0]
             bruteAnswer += tmp[1]
         elif ch == b'*':
-            tmp = await self._read_array()
+            tmp = await self._read_array(reader)
             response = tmp[0]
             bruteAnswer += tmp[1]
         else:
             # we get here if the received message has nothing to do with
             # the RESP protocol  
             print("Reading error...")
-            msg = await self.r.read(100)
+            msg = await reader.read(100)
             print("Reading error...Done!")
             raise Exception(f"Unknown tag: {ch}, msg: {msg}")
         print("Reading reply...Done")
         return response, bruteAnswer
             
-    async def _read_int(self):
+    async def _read_int(self, reader):
         print("Reading integer...")
         length = b''
         bruteAnswer = b''
         ch = b''
         while ch != b'\n':
-            ch = await self.r.read(1)
+            ch = await reader.read(1)
             length += ch
             bruteAnswer += ch
         print("Reading integer...Done!")
         return int(length.decode()[:-1]), bruteAnswer
 
-    async def _read_simple_string(self):
+    async def _read_simple_string(self, reader):
         print("Reading simple string...")
         response = b''
         bruteAnswer = b''
         ch = b''
         while ch != b'\n':
-            ch = await self.r.read(1)
+            ch = await reader.read(1)
             response += ch
             bruteAnswer += ch
         print("Reading simple string...Done!")
         return response.decode()[:-1], bruteAnswer
     
-    async def _read_bluk(self):
+    async def _read_bluk(self, reader):
         print("Reading bulk...")
-        length, bruteAnswer = await self._read_int()
+        length, bruteAnswer = await self._read_int(reader)
         if length == -1:
             return None, bruteAnswer
-        response = await self.r.read(length)
-        bruteAnswer += response + b'\r\n'
+        response = await reader.read(length)
+        ctrl = await reader.read(2)
+        bruteAnswer += response + ctrl
         print("Reading bulk...Done!")
-        return response.decode()[:-1], bruteAnswer
+        return response.decode(), bruteAnswer
 
-    async def _read_array(self):
+    async def _read_array(self, reader):
         print("Reading array...")
-        length, bruteAnswer = await self._read_int()
+        length, bruteAnswer = await self._read_int(reader)
         response = []
         for _ in range(length):
-            ch = await self.r.read(1)
+            ch = await reader.read(1)
             if ch == b'$':
-                tmp = await self._read_bluk()
+                tmp = await self._read_bluk(reader)
             elif ch == b':':
-                tmp = await self._read_int()
+                tmp = await self._read_int(reader)
             response.append(tmp[0])
             bruteAnswer += tmp[1]
         print("Reading array...Done!")
@@ -236,15 +262,24 @@ class Proxy:
         :param host: redis host to address
         :param port: redis port to address
         """
-        print(f"Forwarding query to {host}:{port} ...")
-        await self.connect(host, port)
-        print(f"Writing '{query}' to {host}:{port}...")
-        self.w.write(query)
-        await self.w.drain()
-        print(f"Writing '{query}' to {host}:{port}...Done!")
-        response = await self._read_redis_answer()
-        self.disconnect()
-        print(f"Forwarding query to {host}:{port} ...Done!")
+        if host == REDIS_HOST:
+            print(f"Forwarding query to redis...")
+            print(f"Writing '{query}' to redis...")
+            self.redisW.write(query)
+            await self.redisW.drain()
+            print(f"Writing '{query}' to redis...Done!")
+            response = await self._read_redis_answer(self.redisR)
+            print(f"Forwarding query to redis...Done")
+        else:
+            print(f"Forwarding query to {host}:{port} ...")
+            await self.connect(host, port)
+            print(f"Writing '{query}' to {host}:{port}...")
+            self.w.write(query)
+            await self.w.drain()
+            print(f"Writing '{query}' to {host}:{port}...Done!")
+            response = await self._read_redis_answer(self.r)
+            await self.disconnect()
+            print(f"Forwarding query to {host}:{port} ...Done!")
         return response
 
     async def _treate_get_query(self, params, query):
@@ -473,7 +508,7 @@ def chooseContent():
     print("Choosing content to advertise...")
     global BLOOM_UP_TO_DATE, LOCAL_BLOOM
     tmp = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
-    redis_client = redis.StrictRedis(connection_pool=POOL)
+    #redis_client = redis.StrictRedis(connection_pool=POOL)
     keys = list(redis_client.keys())
     shuffle(keys)
     for i in range(min(len(keys), CAPACITY)):
@@ -496,7 +531,6 @@ def restoreBF(bf_string, sourceID):
     """
     FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
 
-CAIS_PROXY = Proxy()
 async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None):
     """
     Sends CAIs to neighboors with 'sourceID'=sourceID
@@ -517,7 +551,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     json_bloom = b'J' + json_bloom.encode() + b'\r\n'
     # we instanciate a Proxy to use its communication features to communicate
     # with the neighbors
-    proxy = CAIS_PROXY
+    proxy = Proxy()
     # we define a timeout for connection equal to the 'SLEEP_TIME' devided
     # by the number of neighbors we have, because we entend to reduce this
     # time from the sleep time if the connection fails
@@ -571,6 +605,9 @@ async def CAIsProducer():
                                     SERVER
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
+# connect to redis
+proxy = Proxy()
+
 async def client_connected_cb(reader, writer):
     """
     This is the callback that will treat connections to our
@@ -583,22 +620,21 @@ async def client_connected_cb(reader, writer):
     :param reader: the reader of the connection
     :param writer: the writer of the connection
     """
-    proxy = Proxy()
     while True:
         print("Reading query...")
         query = await read(reader)
         if query[:-2] == b'close':
-            print("Connection closed !")
-            await proxy.disconnect()
             writer.close()
             await writer.wait_closed()
-            return 
+            print("Connection closed !")
+            print("Reading query...Done!")
+            break 
         elif query[0:1] == b'J':
             await proxy.treate_JSON(query)
         else:
             response = await proxy.treate_query(query)
             await write(writer, response)
-            return
+            break
         print("Reading query...Done!")
     
 
@@ -648,6 +684,7 @@ async def server():
     """
     A coroutine that lunches the proxy server
     """
+    await proxy.connectToRedis()
     server = await asyncio.start_server(client_connected_cb, host=LOCAL_HOST, port=LOCAL_PORT)
     async with server:
         await server.serve_forever()
