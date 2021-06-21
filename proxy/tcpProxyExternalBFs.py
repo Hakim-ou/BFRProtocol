@@ -62,7 +62,7 @@ connections = dict()
 connectionLocks = dict()
 for ip in ips:
     connections[f"{ip[0]}:{ip[1]}"] = None
-    connectionLocks[f"{ip[0]}:{ip[1]}"] = asyncio.Lock()
+    connectionLocks[f"{ip[0]}:{ip[1]}"] = None
 
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -99,7 +99,7 @@ class Proxy:
         """
         print(f"Connecting to {host}:{port} ...")
         await connectionLocks[f"{host}:{port}"].acquire()
-        print(f"Lock released for {host}:{port}!")
+        print(f"Lock acquired for {host}:{port}!")
         if connections[f"{host}:{port}"] == None:
             # TODO check if connection is still open (try: write("test"))
             connections[f"{host}:{port}"] = await asyncio.open_connection(host=host, port=port)
@@ -120,6 +120,7 @@ class Proxy:
             self.r, self.w = None, None
             self.connected = False
             connectionLocks[f"{self.connectedTo[0]}:{self.connectedTo[1]}"].release()
+            print(f"Lock released for {self.connectedTo[0]}:{self.connectedTo[1]}!")
             self.connectedTo = None
         print("Disconnecting proxy's connections...Done!")
 
@@ -206,7 +207,7 @@ class Proxy:
             msg = await reader.read(100)
             print("Reading error...Done!")
             raise Exception(f"Unknown tag: {ch}, msg: {msg}")
-        print("Reading reply...Done")
+        print("Reading reply...Done!")
         return response, bruteAnswer
             
     async def _read_int(self, reader):
@@ -237,6 +238,7 @@ class Proxy:
         print("Reading bulk...")
         length, bruteAnswer = await self._read_int(reader)
         if length == -1:
+            print("Reading bulk...Done! (-1)")
             return None, bruteAnswer
         response = await reader.read(length)
         ctrl = await reader.read(2)
@@ -283,7 +285,7 @@ class Proxy:
             await self.redisW.drain()
             print(f"Writing '{query}' to redis...Done!")
             response = await self._read_redis_answer(self.redisR)
-            print(f"Forwarding query to redis...Done")
+            print(f"Forwarding query to redis...Done!")
         else:
             print(f"Forwarding query to {host}:{port} ...")
             await self.connect(host, port)
@@ -608,7 +610,6 @@ async def CAIsProducer():
         # check that it is not the same as last time (TODO the last times)
         sleep_time = SLEEP_TIME
         if not BLOOM_UP_TO_DATE:
-        #if True:
             # wait for CAIs to be sent and recuperate sleep_time
             sleep_time = await sendCAIs()
         print(f"Going to sleep for {sleep_time} seconds")
@@ -633,15 +634,14 @@ async def client_connected_cb(reader, writer):
     :param reader: the reader of the connection
     :param writer: the writer of the connection
     """
+    print("New connection received!")
     proxy = Proxy()
     await proxy.connectToRedis()
     while True:
         print("Reading query...")
         query = await read(reader)
         if query[:-2] == b'close':
-            #writer.close()
-            #await writer.wait_closed()
-            #print("Connection closed !")
+            print("Connection closed !")
             print("Reading query...Done!")
             break 
         elif query[0:1] == b'J':
@@ -677,12 +677,6 @@ async def write(writer, data, closeAtEnd=False):
     """
     writer.write(data)
     await writer.drain()
-    #if closeAtEnd:
-    #    writer.write(b'close\r\n')
-    #    await writer.drain()
-    #    #writer.close()
-    #    #await writer.wait_closed()
-    #    print("Closed connection")
 
 def export_loop(coroutine):
     """
@@ -700,6 +694,8 @@ async def server():
     """
     A coroutine that lunches the proxy server
     """
+    for ip in ips:
+        connectionLocks[f"{ip[0]}:{ip[1]}"] = asyncio.Lock()
     server = await asyncio.start_server(client_connected_cb, host=LOCAL_HOST, port=LOCAL_PORT)
     async with server:
         await server.serve_forever()
@@ -720,6 +716,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-
-
-
