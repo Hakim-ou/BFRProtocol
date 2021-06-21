@@ -57,6 +57,12 @@ redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
 # time to sleep between CAIs
 SLEEP_TIME = 5 # TODO change to 1 second
 
+# connections
+connections = dict()
+connectionLocks = dict()
+for ip in ips:
+    connections[f"{ip[0]}:{ip[1]}"] = None
+    connectionLocks[f"{ip[0]}:{ip[1]}"] = asyncio.Lock()
 
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -85,15 +91,22 @@ class Proxy:
         self.connected = False
         self.connectedToRedis = False
         self.r, self.w, self.redisR, self.redisW = None, None, None, None
+            
 
     async def connect(self, host=REDIS_HOST, port=REDIS_PORT, task=None):
         """
         Connect to a host (another node or redis server)
         """
         print(f"Connecting to {host}:{port} ...")
-        #await self.disconnect()
-        self.r, self.w = await asyncio.open_connection(host=host, port=port)
+        await connectionLocks[f"{host}:{port}"].acquire()
+        print(f"Lock released for {host}:{port}!")
+        if connections[f"{host}:{port}"] == None:
+            # TODO check if connection is still open (try: write("test"))
+            connections[f"{host}:{port}"] = await asyncio.open_connection(host=host, port=port)
+            print(f"Connection with {host}:{port} created!")
+        self.r, self.w = connections[f"{host}:{port}"]
         self.connected = True
+        self.connectedTo = [host, port]
         if task is not None:
             task.cancel()
         print(f"Connecting to {host}:{port} ...Done!")
@@ -103,11 +116,11 @@ class Proxy:
         Disconnect from the current connection designed by self.w
         """
         print("Disconnecting proxy's connections...")
-        if self.w is not None:
-            self.w.close()
-            await self.w.wait_closed()
+        if self.connectedTo != None:
+            self.r, self.w = None, None
             self.connected = False
-            self.w, self.r = None, None
+            connectionLocks[f"{self.connectedTo[0]}:{self.connectedTo[1]}"].release()
+            self.connectedTo = None
         print("Disconnecting proxy's connections...Done!")
 
 
@@ -125,6 +138,7 @@ class Proxy:
             if not timing.cancelled():
                 print("Time's up! Canceling connection...")
                 connection.cancel()
+                connectionLocks[f"{host}:{port}"].release()
                 print("Canceling connection...Done!")
         except asyncio.CancelledError:
             print(f"Connecting to {host}:{port} with timeout {timeout} ...Done!")
@@ -576,6 +590,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         # format the msg so we can identify that it is a JSON msg
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
+        print(proxy.w)
         await write(proxy.w, json_bloom, True)
         await proxy.disconnect()
         print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
@@ -605,8 +620,6 @@ async def CAIsProducer():
                                     SERVER
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-# connect to redis
-proxy = Proxy()
 
 async def client_connected_cb(reader, writer):
     """
@@ -620,13 +633,15 @@ async def client_connected_cb(reader, writer):
     :param reader: the reader of the connection
     :param writer: the writer of the connection
     """
+    proxy = Proxy()
+    await proxy.connectToRedis()
     while True:
         print("Reading query...")
         query = await read(reader)
         if query[:-2] == b'close':
-            writer.close()
-            await writer.wait_closed()
-            print("Connection closed !")
+            #writer.close()
+            #await writer.wait_closed()
+            #print("Connection closed !")
             print("Reading query...Done!")
             break 
         elif query[0:1] == b'J':
@@ -634,8 +649,8 @@ async def client_connected_cb(reader, writer):
         else:
             response = await proxy.treate_query(query)
             await write(writer, response)
-            break
         print("Reading query...Done!")
+    await proxy.disconnectRedis()
     
 
 async def read(reader):
@@ -654,7 +669,7 @@ async def read(reader):
 async def write(writer, data, closeAtEnd=False):
     """
     Writes 'data' to the given 'writer' and close the
-    connection at the end if 'closeAtEnd was set to 'True'
+    connection at the end if 'closeAtEnd' was set to 'True'
 
     :param writer: a writer from a connection
     :param data: the data to write to the 'writer'
@@ -662,11 +677,12 @@ async def write(writer, data, closeAtEnd=False):
     """
     writer.write(data)
     await writer.drain()
-    if closeAtEnd:
-        writer.write(b'close\r\n')
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+    #if closeAtEnd:
+    #    writer.write(b'close\r\n')
+    #    await writer.drain()
+    #    #writer.close()
+    #    #await writer.wait_closed()
+    #    print("Closed connection")
 
 def export_loop(coroutine):
     """
@@ -684,7 +700,6 @@ async def server():
     """
     A coroutine that lunches the proxy server
     """
-    await proxy.connectToRedis()
     server = await asyncio.start_server(client_connected_cb, host=LOCAL_HOST, port=LOCAL_PORT)
     async with server:
         await server.serve_forever()

@@ -15,7 +15,6 @@ class Client():
         Connect to the proxy
         """
         print(f"Connecting to proxy {self.host}:{self.port} ...")
-        await self.disconnect()
         self.r, self.w = await asyncio.open_connection(host=self.host, port=self.port)
         self.connected = True
         if task is not None:
@@ -42,7 +41,6 @@ class Client():
         """
         host, port = self.host, self.port
         print(f"Connecting to proxy {host}:{port} with timeout {timeout} ...")
-        await self.disconnect()
         timing = asyncio.create_task(asyncio.sleep(timeout))
         connection = asyncio.create_task(self.connect(host, port, timing))
         try:
@@ -127,7 +125,8 @@ class Client():
         if length == -1:
             return None, bruteAnswer
         response = await self.r.read(length)
-        bruteAnswer += response + b'\r\n'
+        ctrl = await self.r.read(2)
+        bruteAnswer += response + ctrl
         print("Reading bulk...Done!")
         return response.decode(), bruteAnswer
 
@@ -151,13 +150,11 @@ class Client():
     """""""""""""""""""""""""""""""""""""""""""""
 
     async def _send_query(self, query):
-        await self.connect()
         print(f"Writing '{query}' to redis...")
         self.w.write(query)
         await self.w.drain()
         print(f"Writing '{query}' to redis...Done!")
         value, response = await self._read_redis_answer()
-        await self.disconnect()
         return value, response
 
     async def get_query(self, key):
@@ -184,3 +181,14 @@ class Client():
         rvalue, response = await self._send_query(query)
         print(f"SET {{{key}:{value}}} answered {response.decode()}")
         return rvalue, response
+
+    async def send_close(self):
+        """
+        Asks server to close connection
+        """
+        query = "close\r\n".encode()
+        print(f"query: {query}")
+        self.w.write(query)
+        await self.w.drain()
+        await self.disconnect()
+        print("Closed connection")
