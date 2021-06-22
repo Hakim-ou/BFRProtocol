@@ -8,6 +8,8 @@ services:
     build: ./dockerfiles/
     expose:
       - "8080"
+    ports:
+      - "6380:8080"
     volumes:
       - ./proxy:/proxy
     depends_on: 
@@ -17,9 +19,8 @@ services:
       - LOCAL_PORT=8080
       - REDIS_HOST=bfrprotocol_redis1_1
       - REDIS_PORT=6379
-      - NB_NEIGHBORS=2
-      - NEIGHBOR1=bfrprotocol_proxy3_1
-      - NEIGHBOR2=bfrprotocol_proxy2_1
+      - NB_NEIGHBORS=1
+      - NEIGHBOR1=bfrprotocol_proxy2_1
 
   redis2:
     image: redis
@@ -37,9 +38,10 @@ services:
       - LOCAL_PORT=8080
       - REDIS_HOST=bfrprotocol_redis2_1
       - REDIS_PORT=6379
-      - NB_NEIGHBORS=2
+      - NB_NEIGHBORS=3
       - NEIGHBOR1=bfrprotocol_proxy1_1
       - NEIGHBOR2=bfrprotocol_proxy3_1
+      - NEIGHBOR3=bfrprotocol_proxy4_1
   
   redis3:
     image: redis
@@ -57,6 +59,121 @@ services:
       - LOCAL_PORT=8080
       - REDIS_HOST=bfrprotocol_redis3_1
       - REDIS_PORT=6379
+      - NB_NEIGHBORS=1
+      - NEIGHBOR1=bfrprotocol_proxy2_1
+
+  redis4:
+    image: redis
+
+  proxy4:
+    build: ./dockerfiles/
+    expose:
+      - "8080"
+    volumes:
+      - ./proxy:/proxy
+    depends_on: 
+      - redis4
+    environment: 
+      - LOCAL_HOST=bfrprotocol_proxy4_1
+      - LOCAL_PORT=8080
+      - REDIS_HOST=bfrprotocol_redis4_1
+      - REDIS_PORT=6379
       - NB_NEIGHBORS=2
-      - NEIGHBOR1=bfrprotocol_proxy1_1
-      - NEIGHBOR2=bfrprotocol_proxy2_1
+      - NEIGHBOR1=bfrprotocol_proxy2_1
+      - NEIGHBOR2=bfrprotocol_proxy5_1
+  
+  redis5:
+    image: redis
+
+  proxy5:
+    build: ./dockerfiles/
+    expose:
+      - "8080"
+    volumes:
+      - ./proxy:/proxy
+    depends_on: 
+      - redis5
+    environment: 
+      - LOCAL_HOST=bfrprotocol_proxy5_1
+      - LOCAL_PORT=8080
+      - REDIS_HOST=bfrprotocol_redis5_1
+      - REDIS_PORT=6379
+      - NB_NEIGHBORS=1
+      - NEIGHBOR1=bfrprotocol_proxy4_1
+
+  producer1:
+    build: ./test-dockerfiles/
+    volumes:
+      - ./test:/test
+    depends_on: 
+      - proxy1
+    environment: 
+      - ID=1
+      - PROXY_HOST=bfrprotocol_proxy1_1
+      - PROXY_PORT=8080
+
+  consumer1:
+    build: ./test-dockerfiles/
+    volumes:
+      - ./test:/test
+    depends_on: 
+      - proxy1
+    environment: 
+      - PRODUCERS_IDS=1
+      - PROXY_HOST=bfrprotocol_proxy1_1
+      - PROXY_PORT=8080
+
+  producer2:
+    build: ./test-dockerfiles/
+    volumes:
+      - ./test:/test
+    depends_on: 
+      - proxy2
+    environment: 
+      - ID=2
+      - PROXY_HOST=bfrprotocol_proxy2_1
+      - PROXY_PORT=8080
+
+  consumer2:
+    build: ./test-dockerfiles/
+    volumes:
+      - ./test:/test
+    depends_on: 
+      - proxy2
+    environment: 
+      - PRODUCERS_IDS=1
+      - PROXY_HOST=bfrprotocol_proxy2_1
+      - PROXY_PORT=8080
+
+  producer3:
+    build: ./test-dockerfiles/
+    volumes:
+      - ./test:/test
+    depends_on: 
+      - proxy3
+    environment: 
+      - ID=3
+      - PROXY_HOST=bfrprotocol_proxy3_1
+      - PROXY_PORT=8080
+
+  consumer3:
+    build: ./test-dockerfiles/
+    volumes:
+      - ./test:/test
+    depends_on: 
+      - proxy3
+    environment: 
+      - PRODUCERS_IDS=1
+      - PROXY_HOST=bfrprotocol_proxy3_1
+      - PROXY_PORT=8080
+
+  producer5:
+    build: ./test-dockerfiles/
+    volumes:
+      - ./test:/test
+    depends_on: 
+      - proxy5
+    environment: 
+      - ID=5
+      - PROXY_HOST=bfrprotocol_proxy5_1
+      - PROXY_PORT=8080
