@@ -150,10 +150,10 @@ class Client():
     """""""""""""""""""""""""""""""""""""""""""""
 
     async def _send_query(self, query):
-        print(f"Writing '{query}' to redis...")
+        print(f"Writing '{query}' to {self.host}:{self.port}...")
         self.w.write(query)
         await self.w.drain()
-        print(f"Writing '{query}' to redis...Done!")
+        print(f"Writing '{query}' to {self.host}:{self.port}...Done!")
         value, response = await self._read_redis_answer()
         return value, response
 

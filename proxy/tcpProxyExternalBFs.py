@@ -95,7 +95,7 @@ class Proxy:
         for ip in ips:
             self.connectedTo[f"{ip[0]}:{ip[1]}"] = False
         self.connectedToRedis = False
-        self.r, self.w, self.redisR, self.redisW = None, None, None, None
+        self.redisR, self.redisW = None, None
 
     async def connect(self, host=REDIS_HOST, port=REDIS_PORT, task=None):
         """
@@ -107,13 +107,13 @@ class Proxy:
         print(f"Lock acquired for {host}:{port}!")
         if connections[f"{host}:{port}"] == None:
             # TODO check if connection is still open (try: write("test"))
+            print(f"Trying to create connection with {host}:{port}...")
             connections[f"{host}:{port}"] = await asyncio.open_connection(host=host, port=port)
             print(f"Connection with {host}:{port} created!")
             ip = f"I{LOCAL_HOST}:{LOCAL_PORT}\r\n"
             connections[f"{host}:{port}"][1].write(ip.encode())
             await connections[f"{host}:{port}"][1].drain()
             print("Identification complete!")
-        self.r, self.w = connections[f"{host}:{port}"]
         self.connectedTo[f"{host}:{port}"] = True
         if task is not None:
             task.cancel()
@@ -124,7 +124,6 @@ class Proxy:
         Disconnect from the specified connection if not already disconnected
         """
         print(f"Disconnecting from {host}:{port}...")
-        self.r, self.w = None, None
         self.connectedTo[f"{host}:{port}"] = False
         if connectionLocks[f"{host}:{port}"].locked():
             connectionLocks[f"{host}:{port}"].release()
@@ -311,10 +310,11 @@ class Proxy:
         else:
             print(f"Forwarding query to {host}:{port} ...")
             await self.connect(host, port)
+            reader, writer = connections[f"{host}:{port}"]
             print(f"Writing '{query}' to {host}:{port}...")
-            await write(self.r, self.w, query)
+            await write(reader, writer, query)
             print(f"Writing '{query}' to {host}:{port}...Done!")
-            response = await self._read_redis_answer(self.r)
+            response = await self._read_redis_answer(reader)
             self.disconnect(host=host, port=port)
             print(f"Forwarding query to {host}:{port} ...Done!")
         return response
@@ -451,13 +451,11 @@ class Proxy:
         Checks if the key is in the BF of one of the neighbors.
         If so, it sends a request to the neighbor to ask for the
         value. Otherwise, it returns the equevelent of null value,
-        namely: (value=-1, response=b'$-1\r\n')
+        namely: (value=None, response=b'$-1\r\n')
 
         :param key: the key to check neighbors for
         :param query: the received query
         """
-        # the default return value is the standard redis "Not Found" msg
-        self.value, self.response = -1, b'$-1\r\n'
         # we iterate over the known sources from wich we received
         # an advertisment before
         accomodators = []
@@ -472,22 +470,15 @@ class Proxy:
                 if task != except_task:
                     print("task to cancel:", task)
                     task.cancel()
-            #task = tasks.pop()
-            #if task == except_task and len(tasks) != 0:
-            #    # if we cancel current task we'll be stuck at this point
-            #    task = tasks.pop()
-            #    print("task to cancel:", task)
-            #    task.cancel()
-            #elif task != except_task:
-            #    print("task to cancel:", task)
-            #    task.cancel()
 
         async def accomodator(awaitable, ip):
+            # the default return value is the standard redis "Not Found" msg
+            val, resp = None, b'$-1\r\n'
             task = asyncio.create_task(awaitable)
             tasks.append(task)
             print("task added:", task)
             try:
-                self.value, self.response = await task
+                val, resp = await task
             except asyncio.CancelledError:
                 # if this task is cancelled, then the content was allready found
                 # by an other task, we should cancel
@@ -495,20 +486,24 @@ class Proxy:
                 if connectionLocks[f"{ip[0]}:{ip[1]}"].locked():
                     connectionLocks[f"{ip[0]}:{ip[1]}"].release()
                     print(f"Lock released by cancellation for {ip[0]}:{ip[1]}!")
-                #cancellator(task)
                 return
-            if self.value != -1:
+            if val is not None:
                 # if this task finds the content, it will cancel the others
                 print(f"Content found at {ip[0]}:{ip[1]} !")
-                print("task found content:", task)
+                #print("task found content:", task)
                 cancellator(task)
             else:
                 print(f"Content not found at {ip[0]}:{ip[1]} !")
+            return val, resp
 
+        alreadyQueriedNextHopes = set()
         for sourceID in FIB.keys():
             ip = FIB[sourceID]['nextHope']
             if ip == requester:
                 print(f"Skipping source {sourceID} for circular request (nextHope: {ip[0]}:{ip[1]})!")
+                continue
+            if f"{ip[0]}:{ip[1]}" in alreadyQueriedNextHopes:
+                print(f"Next hope {ip[0]}:{ip[1]} already queried..Skipping it!")
                 continue
             # check if the node designated with 'sourceID' might have the information 
             for bf in FIB[sourceID]['bfs']:
@@ -516,14 +511,19 @@ class Proxy:
                     # if so, forward the request to the next hope
                     print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
                     accomodators.append(asyncio.create_task(accomodator(self._forward_query(query, host=ip[0], port=ip[1]), ip)))
+                    alreadyQueriedNextHopes.add(f"{ip[0]}:{ip[1]}")
                     break
+        # the default return value is the standard redis "Not Found" msg
+        value, response = None, b'$-1\r\n'
         # don't leave function unless you have a positive answer (other tasks are cancelled)
         # or all negative answers
         for acc in accomodators:
-            await acc
-        if self.value == -1:
+            result = await acc
+            if result is not None:
+                value, response = result
+        if value is None:
             print("Content not found...404")
-        return self.value, self.response
+        return value, response
 
     async def _populateFIB(self, sourceID, nounce, source_host, source_port, bf_string):
         """
@@ -631,6 +631,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     # we instanciate a Proxy to use its communication features to communicate
     # with the neighbors
     proxy = Proxy()
+    print("constructed proxy")
     # we define a timeout for connection equal to the 'SLEEP_TIME' devided
     # by the number of neighbors we have, because we entend to reduce this
     # time from the sleep time if the connection fails
@@ -655,9 +656,11 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         # format the msg so we can identify that it is a JSON msg
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
+        reader, writer = connections[f"{ip[0]}:{ip[1]}"]
         try:
-            await write(proxy.r, proxy.w, json_bloom)
-        except ConnectionResetError:
+            await write(reader, writer, json_bloom)
+        except ConnectionResetError: # this is the polite way of sockets to slam the phone in the
+                                     # face of an other socket
             await proxy.reconnectTO(host=ip[0], port=ip[1], timeout=timeout)
             if not proxy.connectedTo[f"{ip[0]}:{ip[1]}"]:
                 print(f"reconnection: not connected to {ip[0]}:{ip[1]}")
@@ -667,7 +670,7 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
                 sleep_time -= timeout
                 continue
             print(f"reconnection: connected to {ip[0]}:{ip[1]}")
-            await write(proxy.r, proxy.w, json_bloom)
+            await write(reader, writer, json_bloom)
         proxy.disconnect(host=ip[0], port=ip[1])
         print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
     print("Sending CAI to neighbors...Done !")
@@ -726,7 +729,9 @@ async def client_connected_cb(reader, writer):
             ip[1] = int(ip[1])
         else:
             response = await proxy.treate_query(query, ip)
+            print(f"Writing answer '{response}' to client...")
             await write(reader, writer, response)
+            print(f"Writing answer to client...Done!")
         print("Reading query...Done!")
     await proxy.disconnectRedis()
     
@@ -744,6 +749,43 @@ async def read(reader):
         query += ch
     return query
 
+async def readTO(reader, bytes, timeout=0.000001):
+    """
+    Reads up to 'bytes' character or waits for time out and
+    return an empty byte
+    """
+    async def _readBytesTO(timingTask):
+        print("waiting read")
+        ch = await reader.read(bytes)
+        print("pre-trash:", ch)
+        timingTask.cancel()
+        print("timing cancelled")
+        return ch
+
+    # clean reader buffer
+    timing = asyncio.create_task(asyncio.sleep(timeout))
+    readOne = asyncio.create_task(_readBytesTO(timing))
+    try:
+        # TODO
+        if timing.cancelled():
+            print("A mother task was cancelled...Getting out!")
+            return b''
+        print("waiting timing")
+        await timing
+        print("timing finished:", timing)
+        if not timing.cancelled():
+            print("Time's up! Nothing to read")
+            readOne.cancel()
+            print("cancelled readOne")
+            try:
+                await readOne
+            except asyncio.CancelledError:
+                print("readOne cancelled:", readOne.cancelled())
+                return b''
+    except asyncio.CancelledError:
+        print("Cleaning reader...")
+        return await readOne
+
 async def write(reader, writer, data):
     """
     Writes 'data' to the given 'writer' and close the
@@ -753,27 +795,20 @@ async def write(reader, writer, data):
     :param data: the data to write to the 'writer'
     :param closeAtEnd: ask to close connection at the end
     """
-    async def readOneTO(r, timingTask):
-        await r.read(1)
-        timingTask.cancel()
-
     # clean reader buffer
-    print("Checking if reader is clean...")
-    timing = asyncio.create_task(asyncio.sleep(0.001))
-    readOne = asyncio.create_task(readOneTO(reader, timing))
-    try:
-        await timing
-        if not timing.cancelled():
-            print("Time's up! Nothing to read")
-            readOne.cancel()
-            try:
-                await readOne
-            except asyncio.CancelledError:
-                print("readOne cancelled:", readOne.cancelled())
-    except asyncio.CancelledError:
-        print("Cleaning reader...")
-        await reader.readuntil(separator=b'\n')
-    print("Cleaned reader!")
+    print("Cleaning reader buffer...")
+    chunks = await readTO(reader, 100)
+    ch = chunks
+    while ch != b'':
+        ch = await readTO(reader, 100)
+        chunks += ch
+    #ch = await asyncio.wait_for(reader.read(100), 0.00001)
+    #chunks = ch
+    #while ch != b'':
+    #    ch = await asyncio.wait_for(reader.read(100), 0.00001)
+    #    chunks += ch
+    print("trush detected:", chunks)
+    print("Cleaned reader buffer!")
     writer.write(data)
     await writer.drain()
 
