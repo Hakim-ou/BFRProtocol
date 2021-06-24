@@ -59,9 +59,11 @@ SLEEP_TIME = 5 # TODO change to 1 second
 
 # connections
 connections = dict()
+CAIsConnections = dict()
 connectionLocks = dict()
 for ip in ips:
     connections[f"{ip[0]}:{ip[1]}"] = None
+    CAIsConnections[f"{ip[0]}:{ip[1]}"] = None # will be used by the thread producing CAIs, don't need any locks then
     connectionLocks[f"{ip[0]}:{ip[1]}"] = None
 
 
@@ -88,44 +90,65 @@ class Proxy:
         """
         Initialize the proxy to not being connected to any other host (not even redis server)
         """
-        self.connected = False
+        self.connectedTo = dict()
+        self.CAIConnectedTo = dict()
+        for ip in ips:
+            self.connectedTo[f"{ip[0]}:{ip[1]}"] = False
+            self.CAIConnectedTo[f"{ip[0]}:{ip[1]}"] = False
         self.connectedToRedis = False
-        self.r, self.w, self.redisR, self.redisW = None, None, None, None
+        self.redisR, self.redisW = None, None
             
 
-    async def connect(self, host=REDIS_HOST, port=REDIS_PORT, task=None):
+    async def connect(self, host=REDIS_HOST, port=REDIS_PORT, task=None, CAI=False):
         """
         Connect to a host (another node or redis server)
         """
-        print(f"Connecting to {host}:{port} ...")
-        await connectionLocks[f"{host}:{port}"].acquire()
-        print(f"Lock acquired for {host}:{port}!")
-        if connections[f"{host}:{port}"] == None:
+        if CAI:
             # TODO check if connection is still open (try: write("test"))
-            connections[f"{host}:{port}"] = await asyncio.open_connection(host=host, port=port)
-            print(f"Connection with {host}:{port} created!")
-        self.r, self.w = connections[f"{host}:{port}"]
-        self.connected = True
-        self.connectedTo = [host, port]
+            print(f"Connecting to {host}:{port} (CAI)...")
+            if CAIsConnections[f"{host}:{port}"] == None:
+                CAIsConnections[f"{host}:{port}"] = await asyncio.open_connection(host=host, port=port)
+                print(f"Connection with {host}:{port} (CAI) created!")
+                ip = f"I{LOCAL_HOST}:{LOCAL_PORT}\r\n"
+                write(CAIsConnections[f"{host}:{port}"][1], ip.encode())
+                print("Identification complete (CAI)!")
+            self.CAIConnectedTo[f"{host}:{port}"] = True
+            print(f"Connecting to {host}:{port} (CAI)...Done!")
+        else:
+            print(f"Connecting to {host}:{port} ...")
+            await connectionLocks[f"{host}:{port}"].acquire()
+            print(f"Lock acquired for {host}:{port}!")
+            # TODO check if connection is still open (try: write("test"))
+            if connections[f"{host}:{port}"] == None:
+                connections[f"{host}:{port}"] = await asyncio.open_connection(host=host, port=port)
+                print(f"Connection with {host}:{port} created!")
+                ip = f"I{LOCAL_HOST}:{LOCAL_PORT}\r\n"
+                write(connections[f"{host}:{port}"][1], ip.encode())
+                print("Identification complete!")
+            self.connectedTo[f"{host}:{port}"] = True
+            print(f"Connecting to {host}:{port} ...Done!")
         if task is not None:
             task.cancel()
-        print(f"Connecting to {host}:{port} ...Done!")
 
-    async def disconnect(self):
+    async def disconnect(self, host=REDIS_HOST, port=REDIS_PORT, CAI=False):
         """
         Disconnect from the current connection designed by self.w
         """
-        print("Disconnecting proxy's connections...")
-        if self.connectedTo != None:
-            self.r, self.w = None, None
-            self.connected = False
-            connectionLocks[f"{self.connectedTo[0]}:{self.connectedTo[1]}"].release()
-            print(f"Lock released for {self.connectedTo[0]}:{self.connectedTo[1]}!")
-            self.connectedTo = None
-        print("Disconnecting proxy's connections...Done!")
+        if CAI:
+            print(f"Disconnecting from {host}:{port} (CAI)...")
+            if self.CAIConnectedTo[f"{host}:{port}"]:
+                self.CAIConnectedTo[f"{host}:{port}"] = False
+            print(f"Disconnecting from {host}:{port} (CAI)...Done!")
+        else:
+            print(f"Disconnecting from {host}:{port}...")
+            if self.connectedTo[f"{host}:{port}"]:
+                self.connectedTo[f"{host}:{port}"] = False
+                connectionLocks[f"{host}:{port}"].release()
+                print(f"Lock released for {host}:{port}!")
+            print(f"Disconnecting from {host}:{port}...Done!")
 
 
-    async def connectTO(self, host=REDIS_HOST, port=REDIS_PORT, timeout=1):
+    async def connectTO(self, host=REDIS_HOST, port=REDIS_PORT, timeout=1, CAI=False):
         """
         Connect to a host and if the connection takes longer then timeout
         skip connection
@@ -133,7 +156,7 @@ class Proxy:
         print(f"Connecting to {host}:{port} with timeout {timeout} ...")
         #await self.disconnect()
         timing = asyncio.create_task(asyncio.sleep(timeout))
-        connection = asyncio.create_task(self.connect(host, port, timing))
+        connection = asyncio.create_task(self.connect(host, port, timing,CAI))
         try:
             await timing
             if not timing.cancelled():
@@ -290,15 +313,16 @@ class Proxy:
             print(f"Forwarding query to {host}:{port} ...")
             await self.connect(host, port)
             print(f"Writing '{query}' to {host}:{port}...")
-            self.w.write(query)
-            await self.w.drain()
+            reader, writer = connections[f"{host}:{port}"]
+            writer.write(query)
+            await writer.drain()
             print(f"Writing '{query}' to {host}:{port}...Done!")
-            response = await self._read_redis_answer(self.r)
-            await self.disconnect()
+            response = await self._read_redis_answer(reader)
+            await self.disconnect(host, port)
             print(f"Forwarding query to {host}:{port} ...Done!")
         return response
 
-    async def _treate_get_query(self, params, query):
+    async def _treate_get_query(self, params, query, ip=[]):
         """
         Get queries are the ones to treat specially. We need to see
         if we have the information, and if not we will do something
@@ -319,7 +343,7 @@ class Proxy:
             # neighbors for the moment). 
             print("Content not in cache. Checking neighbors...")
             key = params[0]
-            value, response = await self._checkFIBForContent(key, query)
+            value, response = await self._checkFIBForContent(key, query, ip)
             print("Content not in cache. Checking neighbors...Done!")
         else:
             print("Content found in cache...200 OK")
@@ -340,7 +364,7 @@ class Proxy:
                                                         # 'MODULE LOAD' (but they are not GET-like
                                                         # commands, so no problem
 
-    async def treate_query(self, query):
+    async def treate_query(self, query, ip=[]):
         """
         This function will treat all redis queries, decide
         whether to treat it specially or forward it directlly
@@ -352,7 +376,7 @@ class Proxy:
         command, params = pquery["command"], pquery["params"]
         if command == "GET":
             print("GET command detected. Dealing with it...")
-            response = await self._treate_get_query(params, query)
+            response = await self._treate_get_query(params, query, ip)
             print("GET command detected. Dealing with it...Done!")
         else:
             print("No GET command detected. Forwarding...")
@@ -425,7 +449,7 @@ class Proxy:
                FIB and PIT management
     """""""""""""""""""""""""""""""""""""""""""""
 
-    async def _checkFIBForContent(self, key, query):
+    async def _checkFIBForContent(self, key, query, requester=[]):
         """
         Checks if the key is in the BF of one of the neighbors.
         If so, it sends a request to the neighbor to ask for the
@@ -436,20 +460,23 @@ class Proxy:
         :param query: the received query
         """
         # the default return value is the standard redis "Not Found" msg
-        value, response = -1, b'$-1\r\n'
+        value, response = None, b'$-1\r\n'
         # we iterate over the known sources from wich we received
         # an advertisment before
         for sourceID in FIB.keys():
+            ip = FIB[sourceID]['nextHope']
+            # don't forward the request to the requester
+            if ip == requester:
+                continue
             # check if the node designated with 'sourceID' might have the information 
             for bf in FIB[sourceID]['bfs']:
                 if bf.check(key):
                     # if so, forward the request to the next hope
-                    ip = FIB[sourceID]['nextHope']
                     print(f"Content maybe at {ip[0]}:{ip[1]} .. Sending request...")
                     # TODO we would like to remove the await here, we ask for the content
                     # and with the first true positive we receive we cancel all the other requests
                     value, response = await self._forward_query(query, host=ip[0], port=ip[1])
-                    if value != -1:
+                    if value is not None:
                         # if the bf hit was a true positive return the value and stop there
                         print(f"Content found at {ip[0]}:{ip[1]} !")
                         return value, response
@@ -458,6 +485,7 @@ class Proxy:
                         # to check the other nodes
                         print(f"Content not found at {ip[0]}:{ip[1]} !")
                         break
+            print(f"negative for {ip[0]}:{ip[1]}")
         print("Content not found...404")
         return value, response
 
@@ -580,8 +608,8 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
             continue
         print(f"Sending CAI to {ip[0]}:{ip[1]}...")
         # connect with timeout to the node designated with 'ip'
-        await proxy.connectTO(host=ip[0], port=ip[1], timeout=timeout)
-        if not proxy.connected:
+        await proxy.connectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=True)
+        if not proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"]:
             print("not connected")
             # reduce the time taken by the failed connection from sleep time
             # if we fail all connections we will start right away, because we already
@@ -592,9 +620,8 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         # format the msg so we can identify that it is a JSON msg
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
-        print(proxy.w)
-        await write(proxy.w, json_bloom, True)
-        await proxy.disconnect()
+        await write(CAIsConnections[f"{ip[0]}:{ip[1]}"][1], json_bloom)
+        await proxy.disconnect(host=ip[0], port=ip[1], CAI=True)
         print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
     print("Sending CAI to neighbors...Done !")
     return sleep_time
@@ -637,6 +664,7 @@ async def client_connected_cb(reader, writer):
     print("New connection received!")
     proxy = Proxy()
     await proxy.connectToRedis()
+    ip = []
     while True:
         print("Reading query...")
         query = await read(reader)
@@ -646,8 +674,10 @@ async def client_connected_cb(reader, writer):
             break 
         elif query[0:1] == b'J':
             await proxy.treate_JSON(query)
+        elif query[0:1] == b'I':
+            ip = query[1,-2].decode().split(":")
         else:
-            response = await proxy.treate_query(query)
+            response = await proxy.treate_query(query, ip)
             await write(writer, response)
         print("Reading query...Done!")
     await proxy.disconnectRedis()
@@ -666,7 +696,7 @@ async def read(reader):
         query += ch
     return query
 
-async def write(writer, data, closeAtEnd=False):
+async def write(writer, data):
     """
     Writes 'data' to the given 'writer' and close the
     connection at the end if 'closeAtEnd' was set to 'True'
