@@ -592,7 +592,7 @@ class Proxy:
         print("Populating FIB...Done!")
         # forward CAI to neighbors, except the neighbor that sent us this CAI
         print(f"Forwarding FIB to neighboors...")
-        await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string)
+        await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string, CAI=False)
         print(f"Forwarding FIB to neighbors...Done!")
 
 
@@ -637,7 +637,7 @@ def restoreBF(bf_string, sourceID):
     """
     FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
 
-async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None):
+async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None, CAI=True):
     """
     Sends CAIs to neighboors with 'sourceID'=sourceID
 
@@ -671,8 +671,9 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
             continue
         print(f"Sending CAI to {ip[0]}:{ip[1]}...")
         # connect with timeout to the node designated with 'ip'
-        await proxy.connectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=True)
-        if not proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"]:
+        await proxy.connectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=CAI)
+        connectedTo = proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"] if CAI else proxy.connectedTo[f"{ip[0]}:{ip[1]}"]
+        if not connectedTo:
             print(f"not connected to {ip[0]}:{ip[1]}")
             # reduce the time taken by the failed connection from sleep time
             # if we fail all connections we will start right away, because we already
@@ -683,13 +684,17 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         # format the msg so we can identify that it is a JSON msg
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
-        reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
+        if CAI:
+            reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
+        else:
+            reader, writer = connections[f"{ip[0]}:{ip[1]}"]
         try:
             await write(reader, writer, json_bloom)
         except ConnectionResetError: # this is the polite way of sockets to slam the phone in the
                                      # face of an other socket
-            await proxy.reconnectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=True)
-            if not proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"]:
+            await proxy.reconnectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=CAI)
+            connectedTo = proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"] if CAI else proxy.connectedTo[f"{ip[0]}:{ip[1]}"]
+            if not connectedTo:
                 print(f"reconnection: not connected to {ip[0]}:{ip[1]}")
                 # reduce the time taken by the failed connection. Note that this connection
                 # took twice the time reserved for it at first, that's why we check if
@@ -697,9 +702,12 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
                 sleep_time -= timeout
                 continue
             print(f"reconnection: connected to {ip[0]}:{ip[1]}")
-            reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
+            if CAI:
+                reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
+            else:
+                reader, writer = connections[f"{ip[0]}:{ip[1]}"]
             await write(reader, writer, json_bloom)
-        proxy.disconnect(host=ip[0], port=ip[1], CAI=True)
+        proxy.disconnect(host=ip[0], port=ip[1], CAI=CAI)
         print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
     print("Sending CAI to neighbors...Done !")
     return max(sleep_time, 0)
