@@ -722,11 +722,13 @@ async def client_connected_cb(reader, writer):
             print("Reading query...Done!")
             break 
         elif query[0:1] == b'J':
+            # TODO This uses a separate connection, then why not schedule it instead of waiting it
             await proxy.treate_JSON(query)
         elif query[0:1] == b'I':
             ip = query[1:-2].decode().split(':')
             ip[1] = int(ip[1])
         else:
+            # TODO can we schedule this ?
             response = await proxy.treate_query(query, ip)
             print(f"Writing answer '{response}' to client...")
             await write(reader, writer, response)
