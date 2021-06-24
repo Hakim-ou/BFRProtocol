@@ -151,7 +151,6 @@ class Proxy:
             if not timing.cancelled():
                 print("Time's up! Canceling connection...")
                 connection.cancel()
-                #connectionLocks[f"{host}:{port}"].release()
                 self.disconnect(host=host, port=port)
                 print("Canceling connection...Done!")
         except asyncio.CancelledError:
@@ -749,43 +748,6 @@ async def read(reader):
         query += ch
     return query
 
-async def readTO(reader, bytes, timeout=0.000001):
-    """
-    Reads up to 'bytes' character or waits for time out and
-    return an empty byte
-    """
-    async def _readBytesTO(timingTask):
-        print("waiting read")
-        ch = await reader.read(bytes)
-        print("pre-trash:", ch)
-        timingTask.cancel()
-        print("timing cancelled")
-        return ch
-
-    # clean reader buffer
-    timing = asyncio.create_task(asyncio.sleep(timeout))
-    readOne = asyncio.create_task(_readBytesTO(timing))
-    try:
-        # TODO
-        if timing.cancelled():
-            print("A mother task was cancelled...Getting out!")
-            return b''
-        print("waiting timing")
-        await timing
-        print("timing finished:", timing)
-        if not timing.cancelled():
-            print("Time's up! Nothing to read")
-            readOne.cancel()
-            print("cancelled readOne")
-            try:
-                await readOne
-            except asyncio.CancelledError:
-                print("readOne cancelled:", readOne.cancelled())
-                return b''
-    except asyncio.CancelledError:
-        print("Cleaning reader...")
-        return await readOne
-
 async def write(reader, writer, data):
     """
     Writes 'data' to the given 'writer' and close the
@@ -797,17 +759,15 @@ async def write(reader, writer, data):
     """
     # clean reader buffer
     print("Cleaning reader buffer...")
-    chunks = await readTO(reader, 100)
-    ch = chunks
-    while ch != b'':
-        ch = await readTO(reader, 100)
+    chunks = b''
+    try:
+        ch = await asyncio.wait_for(reader.read(100), 0.00001)
         chunks += ch
-    #ch = await asyncio.wait_for(reader.read(100), 0.00001)
-    #chunks = ch
-    #while ch != b'':
-    #    ch = await asyncio.wait_for(reader.read(100), 0.00001)
-    #    chunks += ch
-    print("trush detected:", chunks)
+        while ch != b'':
+            ch = await asyncio.wait_for(reader.read(100), 0.00001)
+            chunks += ch
+    except asyncio.exceptions.TimeoutError:
+        print("trush detected:", chunks)
     print("Cleaned reader buffer!")
     writer.write(data)
     await writer.drain()
