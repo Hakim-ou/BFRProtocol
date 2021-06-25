@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import asyncio
+from asyncio import exceptions
 from random import shuffle
 import sys, os
 import json
 import time
 import calendar
 import threading
+from multiprocessing import Process, Manager
 import redis
 from probables import BloomFilter
 from collections import deque
@@ -14,6 +16,8 @@ from collections import deque
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
                                     Configuration
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+MANAGER = Manager()
 
 # Local address
 #LOCAL_HOST = sys.argv[1]
@@ -28,8 +32,11 @@ BLOOM_UP_TO_DATE = True # no new data
 
 # initializing localBF
 FALSE_RATE = 0.01
-CAPACITY = 1000
+CAPACITY = 3000
 LOCAL_BLOOM = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+# in here we will store the bfs that we received from neighbors so we're going to forward
+# them during our next CA
+BFs_TO_SHARE = MANAGER.dict()
 
 MAX_BFs_PER_NODE = 100
 # FIB
@@ -162,7 +169,8 @@ class Proxy:
             if not timing.cancelled():
                 print("Time's up! Canceling connection...")
                 connection.cancel()
-                connectionLocks[f"{host}:{port}"].release()
+                if not CAI:
+                    connectionLocks[f"{host}:{port}"].release()
                 print("Canceling connection...Done!")
         except asyncio.CancelledError:
             print(f"Connecting to {host}:{port} with timeout {timeout} ...Done!")
@@ -528,9 +536,11 @@ class Proxy:
         restoreBF(bf_string, sourceID)
         print("Populating FIB...Done!")
         # forward CAI to neighbors, except the neighbor that sent us this CAI
-        print(f"Forwarding FIB to neighboors...")
-        await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string)
-        print(f"Forwarding FIB to neighbors...Done!")
+        # print(f"Forwarding FIB to neighboors...")
+        # await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string)
+        # print(f"Forwarding FIB to neighbors...Done!")
+        # add the bfs we received to the "TO_BE_FORWARDED" set
+        addCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string)
 
 
 
@@ -538,8 +548,17 @@ class Proxy:
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
                             CAIs and CARs producers
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+def addCAIs(sourceID, nextHope, bf_string):
+    """
+    TODO control concurrent access
+    """
+    bf = BloomFilter(hex_string=bf_string)
+    nb_elements = bf.estimate_elements() 
+    if nb_elements < 3000:
+        BFs_TO_SHARE[sourceID] = {'nextHope':nextHope, 'nb_elements':nb_elements, 'bf':BloomFilter(hex_string=bf_string)}
+    print(BFs_TO_SHARE)
 
-def chooseContent():
+def chooseContent(nb_content=CAPACITY):
     """
     Chooses randomlly 'CAPACITY' content from the set of contents
     we possess and loads them into 'LOCAL_BLOOM' after clearing it.
@@ -555,7 +574,7 @@ def chooseContent():
     #redis_client = redis.StrictRedis(connection_pool=POOL)
     keys = list(redis_client.keys())
     shuffle(keys)
-    for i in range(min(len(keys), CAPACITY)):
+    for i in range(min(len(keys), nb_content)):
         tmp.add(keys[i].decode())
     # check if there is a change compared to the old local bloom
     if not LOCAL_BLOOM.jaccard_index(tmp) == 1:
@@ -575,14 +594,14 @@ def restoreBF(bf_string, sourceID):
     """
     FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
 
-async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None):
+async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", exceptions=set(), bf=None):
     """
     Sends CAIs to neighboors with 'sourceID'=sourceID
 
     :param sourceID: the source of the CAI. By default it is the current node, but if we are
             forwarding a CAI it will be different
-    :param nextHope: the neighbor from which we received this CAI. We must know it to avoid
-            resending the CAI to it
+    :param exceptions: the neighbors to exclude from this advertissement (for example the 
+            neighbor from which we received this CAI)
     :param bf: the CAI's bloom filter
     """
     print("Sending CAI to neighbors...")
@@ -599,10 +618,10 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     # we define a timeout for connection equal to the 'SLEEP_TIME' devided
     # by the number of neighbors we have, because we entend to reduce this
     # time from the sleep time if the connection fails
+    exceptions.add(f"{LOCAL_HOST}:{LOCAL_PORT}")
     timeout = sleep_time / len(ips) if len(ips) != 0 else sleep_time
     for ip in ips:
-        if (ip[0] == LOCAL_HOST and ip[1] == LOCAL_PORT)\
-             or (ip[0] == nextHope[0] and ip[1] == nextHope[1]):
+        if f"{ip[0]}:{ip[1]}" in exceptions:
             # avoid sending the CAI to ourselves or to the neighbor that
             # forwarded this information to us
             continue
@@ -632,16 +651,32 @@ async def CAIsProducer():
     and sends update to neighbors if we found any
     """
     while True:
-        # choose content from our local redis server to advertise
-        chooseContent()
-        # check that it is not the same as last time (TODO the last times)
         sleep_time = SLEEP_TIME
+        # choose content from our local redis server to advertise
+        exceptions = set()
+        for source in BFs_TO_SHARE.keys():
+            print(f"Sharing {source} content...")
+            nextHope = BFs_TO_SHARE[source]['nextHope']
+            exceptions.add(f"{nextHope[0]}:{nextHope[1]}")
+            chooseContent(min(int(CAPACITY/3), CAPACITY - BFs_TO_SHARE[source]['nb_elements']))
+            if BLOOM_UP_TO_DATE:
+                bf = BFs_TO_SHARE[source]['bf']
+            else:
+                bf = LOCAL_BLOOM.union(BFs_TO_SHARE[source]['bf'])
+            await sendCAIs(sourceID=source, exceptions={f"{nextHope[0]}:{nextHope[1]}"}, bf=bf.export_hex())
+            print(f"Sharing {source} content...Done!")
+        
+        print("Sharing local content...")
+        chooseContent(int(CAPACITY/3))
+        #await sendCAIs(exceptions=exceptions)
         if not BLOOM_UP_TO_DATE:
-            # wait for CAIs to be sent and recuperate sleep_time
-            sleep_time = await sendCAIs()
+            await sendCAIs()
+        print("Sharing local content...Done!")
         print(f"Going to sleep for {sleep_time} seconds")
         await asyncio.sleep(sleep_time)
 
+def run_CAIsProducer():
+    asyncio.run(CAIsProducer())
 
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -710,6 +745,7 @@ async def write(writer, data):
 
 def export_loop(coroutine):
     """
+    [DEPRICATED]
     lunches the given 'coroutine' on an other thread
     with a new loop
 
@@ -718,6 +754,7 @@ def export_loop(coroutine):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     asyncio.run_coroutine_threadsafe(coroutine, asyncio.get_event_loop())
+    asyncio.run(coroutine)
     loop.run_forever()
 
 async def server():
@@ -730,19 +767,28 @@ async def server():
     async with server:
         await server.serve_forever()
 
-async def main():
+def run_server():
+    asyncio.run(server())
+
+def main():
     """
     The proxy's entry point
     """
     # lunch server
     print("Lunching server....")
-    serverThread = threading.Thread(target=export_loop, args=(server(),))
-    serverThread.start()
+    #serverProcess = Process(target=export_loop, args=(server(),))
+    serverProcess = Process(target=run_server)
+    serverProcess.start()
 
     # lunch CA producer
     print("Lunching CAIs Producer....")
-    CAIsProducerThread = threading.Thread(target=export_loop, args=(CAIsProducer(),))
-    CAIsProducerThread.start()
+    #CAIsProducerProcess = Process(target=export_loop, args=(CAIsProducer(),))
+    CAIsProducerProcess = Process(target=run_CAIsProducer)
+    CAIsProducerProcess.start()
+
+    serverProcess.join()
+    CAIsProducerProcess.join()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    #asyncio.run(main())
+    main()
