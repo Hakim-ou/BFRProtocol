@@ -9,7 +9,7 @@ import sys, os
 import json
 import time
 import calendar
-import threading
+from multiprocessing import Process, Manager
 import redis
 import os
 from probables import BloomFilter
@@ -18,6 +18,8 @@ from collections import deque
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
                                     Configuration
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+# multi process manager
+MANAGER = Manager()
 
 # Local address
 #LOCAL_HOST = sys.argv[1]
@@ -39,6 +41,7 @@ MAX_BFs_PER_NODE = 100
 # FIB
 # forme of entry: 'sourceID': {'nextHope':[ip, port], 'receivedNounces':deque([], MAX_BFs_PER_NODE), 'bfs':deque([], MAX_BFs_PER_NODE)}
 FIB = dict()
+BFs_TO_SHARE = MANAGER.dict()
 
 # load neighbors ip addresses.
 ips = list()
@@ -591,17 +594,25 @@ class Proxy:
         restoreBF(bf_string, sourceID)
         print("Populating FIB...Done!")
         # forward CAI to neighbors, except the neighbor that sent us this CAI
-        print(f"Forwarding FIB to neighboors...")
-        await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string, CAI=False)
-        print(f"Forwarding FIB to neighbors...Done!")
+        # print(f"Forwarding FIB to neighboors...")
+        # await sendCAIs(sourceID, FIB[sourceID]['nextHope'], bf_string, CAI=False)
+        # print(f"Forwarding FIB to neighbors...Done!")
+        print(f"Adding BF from {source_host}:{source_port}...")
+        addCAIs(sourceID, [source_host, source_port], bf_string)
+        print(f"Adding BF from {source_host}:{source_port}...Done!")
 
 
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
                             CAIs and CARs producers
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+def addCAIs(sourceID, nextHope, bf_string):
+    bf = BloomFilter(hex_string=bf_string)
+    nb_elements = bf.estimate_elements()
+    if nb_elements < CAPACITY:
+        BFs_TO_SHARE[sourceID] = {'source':sourceID, 'nextHope':nextHope, 'nb_elements':nb_elements, 'bf':bf}
 
-def chooseContent():
+def chooseContent(nb_elements=int(CAPACITY/3)):
     """
     Chooses randomlly 'CAPACITY' content from the set of contents
     we possess and loads them into 'LOCAL_BLOOM' after clearing it.
@@ -617,7 +628,7 @@ def chooseContent():
     #redis_client = redis.StrictRedis(connection_pool=POOL)
     keys = list(redis_client.keys())
     shuffle(keys)
-    for i in range(min(len(keys), CAPACITY)):
+    for i in range(min(nb_elements, len(keys))):
         tmp.add(keys[i].decode())
     # check if there is a change compared to the old local bloom
     if not LOCAL_BLOOM.jaccard_index(tmp) == 1:
@@ -637,7 +648,7 @@ def restoreBF(bf_string, sourceID):
     """
     FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
 
-async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, LOCAL_PORT], bf=None, CAI=True):
+async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", exceptions=set(), bf=None):
     """
     Sends CAIs to neighboors with 'sourceID'=sourceID
 
@@ -663,16 +674,16 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
     # by the number of neighbors we have, because we entend to reduce this
     # time from the sleep time if the connection fails
     timeout = sleep_time / len(ips) if len(ips) != 0 else sleep_time
+    exceptions.add(f"{LOCAL_HOST}:{LOCAL_PORT}")
     for ip in ips:
-        if (ip[0] == LOCAL_HOST and ip[1] == LOCAL_PORT)\
-             or (ip[0] == nextHope[0] and ip[1] == nextHope[1]):
+        if f"{ip[0]}:{ip[1]}" in exceptions:
             # avoid sending the CAI to ourselves or to the neighbor that
             # forwarded this information to us
             continue
         print(f"Sending CAI to {ip[0]}:{ip[1]}...")
         # connect with timeout to the node designated with 'ip'
-        await proxy.connectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=CAI)
-        connectedTo = proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"] if CAI else proxy.connectedTo[f"{ip[0]}:{ip[1]}"]
+        await proxy.connectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=True)
+        connectedTo = proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"]
         if not connectedTo:
             print(f"not connected to {ip[0]}:{ip[1]}")
             # reduce the time taken by the failed connection from sleep time
@@ -684,16 +695,13 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
         # format the msg so we can identify that it is a JSON msg
         print(f"Writing '{json_bloom}' to proxy {ip[0]}:{ip[1]}...")
         # wait for the write to complete
-        if CAI:
-            reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
-        else:
-            reader, writer = connections[f"{ip[0]}:{ip[1]}"]
+        reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
         try:
             await write(reader, writer, json_bloom)
         except ConnectionResetError: # this is the polite way of sockets to slam the phone in the
                                      # face of an other socket
-            await proxy.reconnectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=CAI)
-            connectedTo = proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"] if CAI else proxy.connectedTo[f"{ip[0]}:{ip[1]}"]
+            await proxy.reconnectTO(host=ip[0], port=ip[1], timeout=timeout, CAI=True)
+            connectedTo = proxy.CAIConnectedTo[f"{ip[0]}:{ip[1]}"]
             if not connectedTo:
                 print(f"reconnection: not connected to {ip[0]}:{ip[1]}")
                 # reduce the time taken by the failed connection. Note that this connection
@@ -702,12 +710,9 @@ async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", nextHope=[LOCAL_HOST, 
                 sleep_time -= timeout
                 continue
             print(f"reconnection: connected to {ip[0]}:{ip[1]}")
-            if CAI:
-                reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
-            else:
-                reader, writer = connections[f"{ip[0]}:{ip[1]}"]
+            reader, writer = CAIsConnections[f"{ip[0]}:{ip[1]}"]
             await write(reader, writer, json_bloom)
-        proxy.disconnect(host=ip[0], port=ip[1], CAI=CAI)
+        proxy.disconnect(host=ip[0], port=ip[1], CAI=True)
         print(f"Sending CAI to {ip[0]}:{ip[1]}...Done!")
     print("Sending CAI to neighbors...Done !")
     return max(sleep_time, 0)
@@ -719,12 +724,24 @@ async def CAIsProducer():
     """
     while True:
         # choose content from our local redis server to advertise
-        chooseContent()
         # check that it is not the same as last time (TODO the last times)
         sleep_time = SLEEP_TIME
+        for source in BFs_TO_SHARE.keys():
+            print(f"Sending CAI from {source}...")
+            chooseContent(CAPACITY - BFs_TO_SHARE[source]['nb_elements'])
+            nextHope = BFs_TO_SHARE[source]['nextHope']
+            exceptions = {f"{nextHope[0]}:{nextHope[1]}"}
+            if BLOOM_UP_TO_DATE:
+                bf = BFs_TO_SHARE[source]['bf'] 
+            else:
+                bf = LOCAL_BLOOM.union(BFs_TO_SHARE[source]['bf'])
+            await sendCAIs(sourceID=source, exceptions=exceptions, bf=bf.export_hex())
+            print(f"Sending CAI from {source}...Done!")
+        chooseContent()
         if not BLOOM_UP_TO_DATE:
-            # wait for CAIs to be sent and recuperate sleep_time
-            sleep_time = await sendCAIs()
+            print(f"Sending local CAI...")
+            await sendCAIs()
+            print(f"Sending local CAI...Done!")
         print(f"Going to sleep for {sleep_time} seconds")
         await asyncio.sleep(sleep_time)
 
@@ -772,6 +789,9 @@ async def client_connected_cb(reader, writer):
             print(f"Writing answer to client...Done!")
         print("Reading query...Done!")
     await proxy.disconnectRedis()
+
+def run_CAIsProducer():
+    asyncio.run(CAIsProducer())
     
 
 async def read(reader):
@@ -813,6 +833,7 @@ async def write(reader, writer, data):
 
 def export_loop(coroutine):
     """
+    [DEPRICATED]
     lunches the given 'coroutine' on an other thread
     with a new loop
 
@@ -829,24 +850,29 @@ async def server():
     """
     for ip in ips:
         connectionLocks[f"{ip[0]}:{ip[1]}"] = asyncio.Lock()
-    print(connectionLocks)
     server = await asyncio.start_server(client_connected_cb, host=LOCAL_HOST, port=LOCAL_PORT)
     async with server:
         await server.serve_forever()
 
-async def main():
+def run_server():
+    asyncio.run(server())
+
+def main():
     """
     The proxy's entry point
     """
     # lunch server
     print("Lunching server....")
-    serverThread = threading.Thread(target=export_loop, args=(server(),))
-    serverThread.start()
+    serverProcess = Process(target=run_server)
+    serverProcess.start()
 
     # lunch CA producer
     print("Lunching CAIs Producer....")
-    CAIsProducerThread = threading.Thread(target=export_loop, args=(CAIsProducer(),))
-    CAIsProducerThread.start()
+    CAIsProducerProcess = Process(target=run_CAIsProducer)
+    CAIsProducerProcess.start()
+
+    serverProcess.join()
+    CAIsProducerProcess.join()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
