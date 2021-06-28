@@ -4,6 +4,8 @@ import asyncio
 from asyncio.tasks import create_task
 from socket import error as SocketError
 import errno
+import cProfile
+from probables.hashes import (default_md5)
 from random import shuffle
 import sys, os
 import json
@@ -11,7 +13,6 @@ import time
 import calendar
 from multiprocessing import Process, Manager
 import redis
-import os
 from probables import BloomFilter
 from collections import deque
 
@@ -33,9 +34,9 @@ REDIS_PORT = int(os.environ['REDIS_PORT'])
 BLOOM_UP_TO_DATE = True # no new data
 
 # initializing localBF
-FALSE_RATE = 0.01
+FALSE_RATE = 0.05
 CAPACITY = 1000
-LOCAL_BLOOM = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+LOCAL_BLOOM = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE, hash_function=default_md5)
 
 MAX_BFs_PER_NODE = 100
 # FIB
@@ -607,7 +608,7 @@ class Proxy:
                             CAIs and CARs producers
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 def addCAIs(sourceID, nextHope, bf_string):
-    bf = BloomFilter(hex_string=bf_string)
+    bf = BloomFilter(hex_string=bf_string, hash_function=default_md5)
     nb_elements = bf.estimate_elements()
     if nb_elements < CAPACITY:
         BFs_TO_SHARE[sourceID] = {'source':sourceID, 'nextHope':nextHope, 'nb_elements':nb_elements, 'bf':bf}
@@ -624,7 +625,7 @@ def chooseContent(nb_elements=int(CAPACITY/3)):
     """
     print("Choosing content to advertise...")
     global BLOOM_UP_TO_DATE, LOCAL_BLOOM
-    tmp = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE)
+    tmp = BloomFilter(est_elements=CAPACITY, false_positive_rate=FALSE_RATE, hash_function=default_md5)
     #redis_client = redis.StrictRedis(connection_pool=POOL)
     keys = list(redis_client.keys())
     shuffle(keys)
@@ -646,7 +647,7 @@ def restoreBF(bf_string, sourceID):
     :param: bf_string hexa decimal string representation
     :param: sourceID the source of this bf
     """
-    FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string))
+    FIB[sourceID]['bfs'].appendleft(BloomFilter(hex_string=bf_string, hash_function=default_md5))
 
 async def sendCAIs(sourceID=f"{LOCAL_HOST}:{LOCAL_PORT}", exceptions=set(), bf=None):
     """
@@ -764,6 +765,8 @@ async def client_connected_cb(reader, writer):
     :param reader: the reader of the connection
     :param writer: the writer of the connection
     """
+    pr = cProfile.Profile()
+    pr.enable()
     print("New connection received!")
     proxy = Proxy()
     ip = []
@@ -789,6 +792,8 @@ async def client_connected_cb(reader, writer):
             print(f"Writing answer to client...Done!")
         print("Reading query...Done!")
     await proxy.disconnectRedis()
+    pr.disable()
+    pr.dump_stats(f"/proxy/profile_{LOCAL_HOST}:{LOCAL_PORT}_server.prof")
 
 def run_CAIsProducer():
     asyncio.run(CAIsProducer())
